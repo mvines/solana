@@ -109,6 +109,7 @@ impl BankingStage {
                                         break Some(BankingStageReturnType::ChannelDisconnected);
                                     }
                                     Error::BankError(BankError::MaxHeightReached) => {
+                                        error!("WE JUST LOST SOME GOOD TRANSACTIONS HERE");
                                         // Bank has reached its max tick height.  Exit quietly
                                         // and wait for the PohRecorder to start leader rotation
                                         break None;
@@ -217,6 +218,7 @@ impl BankingStage {
                 })
                 .collect();
             debug!("verified transactions {}", transactions.len());
+            warn!("verified transactions {:?}", transactions);
             Self::process_transactions(bank, &transactions, poh)?;
             new_tx_count += transactions.len();
         }

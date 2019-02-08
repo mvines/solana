@@ -106,6 +106,7 @@ impl PohService {
             let res = poh.tick();
             if let Err(e) = res {
                 if let Error::PohRecorderError(PohRecorderError::MaxHeightReached) = e {
+                    error!("BOOOOOOOOOOOOOOOOOOOOOOOOOOOOOM");
                     // Leader rotation should only happen if a max_tick_height was specified
                     to_validator_sender.send(TpuReturnType::LeaderRotation(max_tick_height))?;
                 }
