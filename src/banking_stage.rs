@@ -7,6 +7,7 @@ use crate::compute_leader_confirmation_service::ComputeLeaderConfirmationService
 use crate::counter::Counter;
 use crate::entry::Entry;
 use crate::packet::Packets;
+use crate::packet::SharedPackets;
 use crate::poh_recorder::{PohRecorder, PohRecorderError};
 use crate::poh_service::{Config, PohService};
 use crate::result::{Error, Result};
@@ -27,10 +28,18 @@ use std::time::Duration;
 use std::time::Instant;
 use sys_info;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+pub type InflightInfo = Vec<(SharedPackets, usize)>;
+
+#[derive(Debug)]
 pub enum BankingStageReturnType {
     LeaderRotation(u64),
     ChannelDisconnected,
+    Inflight(InflightInfo),
+}
+
+#[derive(Debug)]
+pub enum BankingStageError {
+    Inflight(InflightInfo),
 }
 
 // number of threads is 1 until mt bank is ready
@@ -86,6 +95,9 @@ impl BankingStage {
                 Builder::new()
                     .name("solana-banking-stage-tx".to_string())
                     .spawn(move || {
+                        //let mut signal_exit = true;
+                        let mut signal_exit = false;
+                        let mut inflights: InflightInfo = vec![];
                         let return_result = loop {
                             if let Err(e) = Self::process_packets(
                                 &thread_bank,
@@ -105,14 +117,22 @@ impl BankingStage {
                                         break Some(BankingStageReturnType::ChannelDisconnected);
                                     }
                                     Error::BankError(BankError::RecordFailure) => {
-                                        warn!("Bank failed to record");
                                         break Some(BankingStageReturnType::ChannelDisconnected);
                                     }
-                                    Error::BankError(BankError::MaxHeightReached) => {
-                                        error!("WE JUST LOST SOME GOOD TRANSACTIONS HERE");
+                                    Error::BankingStageError(BankingStageError::Inflight(
+                                        transactions,
+                                    )) => {
+                                        //                                    Error::BankError(BankError::MaxHeightReached) => {
+                                        error!(
+                                            "WE JUST LOST SOME GOOD TRANSACTIONS HERE: {:?}",
+                                            transactions
+                                        );
+                                        signal_exit = false;
+                                        inflights.extend(transactions);
+                                        //                                        break Some(BankingStageReturnType::Inflight(transactions));
                                         // Bank has reached its max tick height.  Exit quietly
                                         // and wait for the PohRecorder to start leader rotation
-                                        break None;
+                                        //                                        break None;
                                     }
                                     _ => {
                                         error!("solana-banking-stage-tx: unhandled error: {:?}", e)
@@ -120,15 +140,22 @@ impl BankingStage {
                                 }
                             }
                             if thread_banking_exit.load(Ordering::Relaxed) {
+                                error!("exit request!!!");
                                 break None;
                             }
                         };
 
                         // Signal exit only on "Some" error
-                        if return_result.is_some() {
+                        if signal_exit && return_result.is_some() {
                             thread_banking_exit.store(true, Ordering::Relaxed);
                         }
-                        return_result
+                        error!(
+                            "banking_stage thread bye bye: {:?} -- inflights={}",
+                            return_result,
+                            inflights.len()
+                        );
+                        //                        return_result
+                        Some(BankingStageReturnType::Inflight(inflights))
                     })
                     .unwrap()
             })
@@ -145,7 +172,8 @@ impl BankingStage {
     }
 
     pub fn num_threads() -> u32 {
-        sys_info::cpu_num().unwrap_or(NUM_THREADS)
+        //sys_info::cpu_num().unwrap_or(NUM_THREADS)
+        1
     }
 
     /// Convert the transactions from a blob of binary data to a vector of transactions
@@ -160,18 +188,22 @@ impl BankingStage {
         bank: &Arc<Bank>,
         transactions: &[Transaction],
         poh: &PohRecorder,
-    ) -> Result<()> {
-        debug!("transactions: {}", transactions.len());
+    ) -> Result<(usize)> {
+        error!("transactions: {}", transactions.len());
         let mut chunk_start = 0;
         while chunk_start != transactions.len() {
             let chunk_end = chunk_start + Entry::num_will_fit(&transactions[chunk_start..]);
 
-            bank.process_and_record_transactions(&transactions[chunk_start..chunk_end], poh)?;
-
+            let result =
+                bank.process_and_record_transactions(&transactions[chunk_start..chunk_end], poh);
+            if Err(BankError::MaxHeightReached) == result {
+                break;
+            }
+            result?;
             chunk_start = chunk_end;
         }
         debug!("done process_transactions");
-        Ok(())
+        Ok(chunk_start)
     }
 
     /// Process the incoming packets
@@ -197,30 +229,63 @@ impl BankingStage {
         let count = mms.iter().map(|x| x.1.len()).sum();
         let proc_start = Instant::now();
         let mut new_tx_count = 0;
+
+        let mut inflight = vec![];
+        let mut shutdown = false;
         for (msgs, vers) in mms {
+            if shutdown {
+                inflight.push((msgs, 0));
+                continue;
+            }
+
             let transactions = Self::deserialize_transactions(&msgs.read().unwrap());
             reqs_len += transactions.len();
 
             debug!("transactions received {}", transactions.len());
 
+            let mut transaction_index = Vec::with_capacity(transactions.len());
+            let mut i = 0;
             let transactions: Vec<_> = transactions
                 .into_iter()
                 .zip(vers)
-                .filter_map(|(tx, ver)| match tx {
-                    None => None,
-                    Some(tx) => {
-                        if tx.verify_refs() && ver != 0 {
-                            Some(tx)
-                        } else {
-                            None
+                .filter_map(|(tx, ver)| {
+                    i += 1;
+                    match tx {
+                        None => None,
+                        Some(tx) => {
+                            if tx.verify_refs() && ver != 0 {
+                                transaction_index.push(i - 1);
+                                Some(tx)
+                            } else {
+                                None
+                            }
                         }
                     }
                 })
                 .collect();
             debug!("verified transactions {}", transactions.len());
             warn!("verified transactions {:?}", transactions);
-            Self::process_transactions(bank, &transactions, poh)?;
-            new_tx_count += transactions.len();
+            let not_processed = Self::process_transactions(bank, &transactions, poh)?;
+            if not_processed < transactions.len() {
+                shutdown = true;
+                error!("transaction_index: {}", transaction_index[not_processed]);
+                inflight.push((msgs, transaction_index[not_processed]));
+
+                /*
+                    let mut unprocessed_transactions = vec![];
+                    unprocessed_transactions.extend_from_slice(&transactions[chunk_start..]);
+
+                    error!(
+                        "X-193821382132321 --- MaxHeightReached {} - {} [{:?}]",
+                        chunk_start,
+                        unprocessed_transactions.len(),
+                        unprocessed_transactions
+                    );
+                    Err(BankingStageError::Inflight(unprocessed_transactions))?;
+                }
+                */
+            }
+            new_tx_count += not_processed;
         }
 
         inc_new_counter_info!(
@@ -239,7 +304,28 @@ impl BankingStage {
         );
         inc_new_counter_info!("banking_stage-process_packets", count);
         inc_new_counter_info!("banking_stage-process_transactions", new_tx_count);
+
+        if inflight.len() > 0 {
+            error!("GOT INFLIGHTS: {}", inflight.len());
+            Err(BankingStageError::Inflight(inflight))?;
+        }
+
         Ok(())
+    }
+
+    pub fn fuu(&mut self) -> InflightInfo {
+        error!("fuuuu");
+        let mut inflight_transactions: InflightInfo = vec![];
+
+        for bank_thread_hdl in self.bank_thread_hdls.drain(..) {
+            let thread_return_value = bank_thread_hdl.join();
+            if let Ok(Some(BankingStageReturnType::Inflight(inflights))) = thread_return_value {
+                inflight_transactions.extend(inflights);
+            }
+            //error!("fuuuu: thread_return_value: {:?}", thread_return_value);
+        }
+        inflight_transactions
+        //        Ok(())
     }
 }
 
@@ -248,10 +334,19 @@ impl Service for BankingStage {
 
     fn join(self) -> thread::Result<Option<BankingStageReturnType>> {
         let mut return_value = None;
+        error!("BankingStage join!");
 
         for bank_thread_hdl in self.bank_thread_hdls {
             let thread_return_value = bank_thread_hdl.join()?;
             if thread_return_value.is_some() {
+                /*
+                if return_value.is_some() && return_value != thread_return_value {
+                    warn!(
+                        "Warn: inconsistent bank_thread return values: {:?} != {:?}",
+                        return_value, thread_return_value
+                    );
+                }
+                */
                 return_value = thread_return_value;
             }
         }
@@ -259,9 +354,11 @@ impl Service for BankingStage {
         self.compute_confirmation_service.join()?;
 
         let poh_return_value = self.poh_service.join()?;
+        error!("poh_return_value: {:?}", poh_return_value);
         match poh_return_value {
             Ok(_) => (),
             Err(Error::PohRecorderError(PohRecorderError::MaxHeightReached)) => {
+                error!("YIS");
                 return_value = Some(BankingStageReturnType::LeaderRotation(self.max_tick_height));
             }
             Err(Error::SendError) => {

@@ -32,6 +32,31 @@ pub struct TpuForwarder {
 }
 
 impl TpuForwarder {
+    pub fn forward_inflight(
+        shared_packets: crate::packet::SharedPackets,
+        index: usize,
+        cluster_info: &Arc<RwLock<ClusterInfo>>,
+    ) {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap(); // TODO?;
+
+        let my_id = cluster_info.read().unwrap().id();
+
+        let send_addr = cluster_info.read().unwrap().leader_data().unwrap().tpu;
+        //            get_forwarding_addr(cluster_info.read().unwrap().leader_data(), &my_id).unwrap(); // TODO
+
+        let packets = shared_packets.read().unwrap();
+        assert_eq!(index, 0); //TODO: use index
+        error!(
+            "Forwarding {} packets to {:?}",
+            packets.packets.len(),
+            send_addr
+        );
+        for p in &packets.packets {
+            error!("Forwarding packet to {:?}: {:?}", send_addr, p,);
+            socket.send_to(&p.data[0..p.meta.size], &send_addr).unwrap(); // TODO
+        }
+    }
+
     fn forward(receiver: &PacketReceiver, cluster_info: &Arc<RwLock<ClusterInfo>>) -> Result<()> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
 

@@ -491,13 +491,13 @@ impl Bank {
                 }
             })
             .collect();
-        debug!("processed: {:?} ", processed_transactions);
+        error!("processed: {:?} ", processed_transactions);
         // unlock all the accounts with errors which are filtered by the above `filter_map`
         if !processed_transactions.is_empty() {
             let hash = Transaction::hash(&processed_transactions);
             // record and unlock will unlock all the successfull transactions
             poh.record(hash, processed_transactions).map_err(|e| {
-                warn!("record failure: {:?}", e);
+                error!("record failure: {:?}", e);
                 match e {
                     Error::PohRecorderError(PohRecorderError::MaxHeightReached) => {
                         BankError::MaxHeightReached

@@ -74,13 +74,24 @@ impl SigVerifyStage {
             "sigverify_stage-verified_entries_send",
             verified_batch.len()
         );
+        error!("SIG VERIFY batch of: {}", verified_batch.len());
+        error!("SIG VERIFY batch of: {:?}", verified_batch);
 
-        if sendr
+        let r = sendr
             .lock()
             .expect("lock in fn verify_batch in tpu")
-            .send(verified_batch)
-            .is_err()
-        {
+            .send(verified_batch);
+
+        if r.is_err() {
+            /*
+                sendr
+                .lock()
+                .expect("lock in fn verify_batch in tpu")
+                .send(verified_batch)
+                .is_err()
+            {
+            */
+            error!("SIG VERIFY send error");
             return Err(Error::SendError);
         }
 

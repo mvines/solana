@@ -135,6 +135,8 @@ impl Tpu {
         cluster_info: Arc<RwLock<ClusterInfo>>,
     ) {
         self.tpu_mode_close();
+
+        // TODO: same code here....
         let tpu_forwarder = TpuForwarder::new(transactions_sockets, cluster_info);
         self.tpu_mode = Some(TpuMode::Forwarder(ForwarderServices::new(tpu_forwarder)));
     }
@@ -159,6 +161,7 @@ impl Tpu {
 
         self.exit = Arc::new(AtomicBool::new(false));
         let (packet_sender, packet_receiver) = channel();
+
         let fetch_stage = FetchStage::new_with_sender(
             transactions_sockets,
             self.exit.clone(),
@@ -183,7 +186,8 @@ impl Tpu {
         let broadcast_service = BroadcastService::new(
             bank.clone(),
             broadcast_socket,
-            cluster_info,
+            //cluster_info,
+            cluster_info.clone(),
             blob_index,
             bank.leader_scheduler.clone(),
             entry_receiver,
@@ -199,7 +203,29 @@ impl Tpu {
             cluster_info_vote_listener,
             broadcast_service,
         );
+
+        let mut old_tpu_mode = self.tpu_mode.take();
         self.tpu_mode = Some(TpuMode::Leader(svcs));
+
+        if let Some(TpuMode::Leader(svcs)) = old_tpu_mode.as_mut() {
+            error!("tpu_mode_close bank fuu...");
+            let inflight_transactions = svcs.banking_stage.fuu();
+            error!("tpu_mode_close bank fuu: {:?}", inflight_transactions);
+            for (shared_packets, index) in inflight_transactions {
+                error!(
+                    "forwarded with: {:?}",
+                    TpuForwarder::forward_inflight(shared_packets, index, &cluster_info)
+                );
+            }
+            /*
+            inflight_transactions.map(|(shared_packets, index)| {
+                error!(
+                    "forwarded with: {:?}",
+                    TpuForwarder::forward_inflight(shared_packets, index, &cluster_info)
+                );
+            });
+            */
+        }
     }
 
     pub fn is_leader(&self) -> bool {
