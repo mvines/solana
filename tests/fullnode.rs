@@ -1,7 +1,7 @@
 use log::*;
+use solana::blocktree::create_tmp_sample_ledger;
 use solana::client::mk_client;
 use solana::cluster_info::Node;
-use solana::db_ledger::create_tmp_sample_ledger;
 use solana::fullnode::{Fullnode, FullnodeConfig};
 use solana::thin_client::{poll_gossip_for_leader, retry_get_balance};
 use solana::voting_keypair::VotingKeypair;
@@ -70,7 +70,7 @@ fn test_fullnode_transact_while_rotating_fast() {
         debug!("sent transfer, signature is {:?}", signature);
         std::thread::sleep(std::time::Duration::from_millis(100));
         client.poll_for_signature(&signature).unwrap();
-        debug!("transfer signature confirmed");
+        debug!("transfer signature confirmed: {:?}", signature);
         let actual_bob_balance =
             retry_get_balance(&mut client, &bob, Some(expected_bob_balance)).unwrap();
         assert_eq!(actual_bob_balance, expected_bob_balance);
