@@ -91,9 +91,14 @@ impl PohService {
                     for _ in 1..num {
                         let res = poh.hash();
                         if let Err(e) = res {
-                            if let Error::PohRecorderError(PohRecorderError::MaxHeightReached) = e {
-                                to_validator_sender
-                                    .send(TpuReturnType::LeaderRotation(max_tick_height))?;
+                            if let Error::PohRecorderError(PohRecorderError::MaxHeightReached(
+                                last_entry_id,
+                            )) = e
+                            {
+                                to_validator_sender.send(TpuReturnType::LeaderRotation(
+                                    max_tick_height,
+                                    last_entry_id,
+                                ))?;
                             }
                             return Err(e);
                         }
@@ -105,10 +110,18 @@ impl PohService {
             }
             let res = poh.tick();
             if let Err(e) = res {
-                if let Error::PohRecorderError(PohRecorderError::MaxHeightReached) = e {
-                    error!("BOOOOOOOOOOOOOOOOOOOOOOOOOOOOOM");
+                if let Error::PohRecorderError(PohRecorderError::MaxHeightReached(last_entry_id)) =
+                    e
+                {
+                    error!(
+                        "BOOOOOOOOOOOOOOOOOOOOOOOOOOOOOM at max_tick_height={} last_entry_id={}",
+                        max_tick_height, last_entry_id
+                    );
                     // Leader rotation should only happen if a max_tick_height was specified
-                    to_validator_sender.send(TpuReturnType::LeaderRotation(max_tick_height))?;
+                    to_validator_sender.send(TpuReturnType::LeaderRotation(
+                        max_tick_height,
+                        last_entry_id,
+                    ))?;
                 }
                 return Err(e);
             }

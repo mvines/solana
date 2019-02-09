@@ -21,7 +21,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 pub enum TpuReturnType {
-    LeaderRotation(u64),
+    LeaderRotation(u64, Hash),
 }
 
 pub type TpuRotationSender = Sender<TpuReturnType>;
@@ -157,6 +157,10 @@ impl Tpu {
         to_validator_sender: &TpuRotationSender,
         blob_sender: &BlobSender,
     ) {
+        error!(
+            "=========== switch_to_leader: max_tick_height={} last_entry_id={:?} ===",
+            max_tick_height, last_entry_id
+        );
         self.tpu_mode_close();
 
         self.exit = Arc::new(AtomicBool::new(false));

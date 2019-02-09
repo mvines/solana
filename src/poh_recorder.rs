@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum PohRecorderError {
     InvalidCallingObject,
-    MaxHeightReached,
+    MaxHeightReached(Hash),
 }
 
 #[derive(Clone)]
@@ -46,6 +46,10 @@ impl PohRecorder {
         // hasn't been reached.
         // This guarantees PoH order and Entry production and banks LastId queue is the same
         let mut poh = self.poh.lock().unwrap();
+        error!(
+            "%%%%%%%%% tick! {} >= {} %%%%%%%%%%%",
+            poh.tick_height, self.max_tick_height
+        );
 
         self.check_tick_height(&poh)?;
 
@@ -82,7 +86,9 @@ impl PohRecorder {
 
     fn check_tick_height(&self, poh: &Poh) -> Result<()> {
         if poh.tick_height >= self.max_tick_height {
-            Err(Error::PohRecorderError(PohRecorderError::MaxHeightReached))
+            Err(Error::PohRecorderError(PohRecorderError::MaxHeightReached(
+                poh.id,
+            )))
         } else {
             Ok(())
         }
@@ -97,12 +103,17 @@ impl PohRecorder {
             id: entry.id,
             transactions: txs,
         };
+        error!("Sent new entry: {:?}", entry);
         self.sender.send(vec![entry])?;
         Ok(())
     }
 
     fn register_and_send_tick(&self, poh: &mut Poh) -> Result<()> {
         let tick = poh.tick();
+        error!(
+            "%%%%%%%%% register_and_send_tick for {} ! %%%%%%%%%%%",
+            tick.tick_height
+        );
         let tick = Entry {
             tick_height: tick.tick_height,
             num_hashes: tick.num_hashes,
@@ -110,7 +121,8 @@ impl PohRecorder {
             transactions: vec![],
         };
         self.bank.register_tick(&tick.id);
-        self.sender.send(vec![tick])?;
+        //self.sender.send(vec![tick])?;
+        self.sender.send(vec![tick]).expect("oof");
         Ok(())
     }
 }

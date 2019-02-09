@@ -313,11 +313,12 @@ impl Fullnode {
         }
     }
 
-    fn leader_to_validator(&mut self, tick_height: u64) -> FullnodeReturnType {
+    fn leader_to_validator(&mut self, tick_height: u64, last_entry_id: Hash) -> FullnodeReturnType {
         trace!(
-            "leader_to_validator({:?}): tick_height={}",
+            "leader_to_validator({:?}): tick_height={} last_entry_id={}",
             self.id,
             tick_height,
+            last_entry_id,
         );
 
         while self.bank.tick_height() < tick_height {
@@ -342,7 +343,7 @@ impl Fullnode {
 
         if scheduled_leader == self.id {
             debug!("node is still the leader");
-            let last_entry_id = self.node_services.tvu.get_state();
+            // let last_entry_id = self.node_services.tpu.get_state();
             self.validator_to_leader(tick_height, last_entry_id);
             FullnodeReturnType::LeaderToLeaderRotation
         } else {
@@ -423,8 +424,11 @@ impl Fullnode {
             if self.node_services.tpu.is_leader() {
                 let should_be_forwarder = self.to_validator_receiver.recv_timeout(timeout);
                 match should_be_forwarder {
-                    Ok(TpuReturnType::LeaderRotation(tick_height)) => {
-                        return Some((self.leader_to_validator(tick_height), tick_height + 1));
+                    Ok(TpuReturnType::LeaderRotation(tick_height, last_entry_id)) => {
+                        return Some((
+                            self.leader_to_validator(tick_height, last_entry_id),
+                            tick_height + 1,
+                        ));
                     }
                     Err(RecvTimeoutError::Timeout) => continue,
                     _ => return None,

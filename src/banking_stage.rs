@@ -357,7 +357,7 @@ impl Service for BankingStage {
         error!("poh_return_value: {:?}", poh_return_value);
         match poh_return_value {
             Ok(_) => (),
-            Err(Error::PohRecorderError(PohRecorderError::MaxHeightReached)) => {
+            Err(Error::PohRecorderError(PohRecorderError::MaxHeightReached(_))) => {
                 error!("YIS");
                 return_value = Some(BankingStageReturnType::LeaderRotation(self.max_tick_height));
             }

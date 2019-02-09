@@ -499,7 +499,7 @@ impl Bank {
             poh.record(hash, processed_transactions).map_err(|e| {
                 error!("record failure: {:?}", e);
                 match e {
-                    Error::PohRecorderError(PohRecorderError::MaxHeightReached) => {
+                    Error::PohRecorderError(PohRecorderError::MaxHeightReached(_)) => {
                         BankError::MaxHeightReached
                     }
                     _ => BankError::RecordFailure,
