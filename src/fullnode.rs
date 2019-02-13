@@ -314,16 +314,20 @@ impl Fullnode {
     }
 
     fn leader_to_validator(&mut self, tick_height: u64, last_entry_id: Hash) -> FullnodeReturnType {
-        trace!(
+        error!(
             "leader_to_validator({:?}): tick_height={} last_entry_id={}",
-            self.id,
-            tick_height,
-            last_entry_id,
+            self.id, tick_height, last_entry_id,
         );
 
         while self.bank.tick_height() < tick_height {
+            panic!("NO TICK");
             sleep(Duration::from_millis(10));
         }
+        error!(
+            "TVU BANK IS now at tick_height={} last_entry_id={}",
+            self.bank.tick_height(),
+            self.node_services.tvu.get_state()
+        );
 
         let scheduled_leader = {
             let mut leader_scheduler = self.bank.leader_scheduler.write().unwrap();
@@ -342,7 +346,7 @@ impl Fullnode {
             .set_leader(scheduled_leader);
 
         if scheduled_leader == self.id {
-            debug!("node is still the leader");
+            error!("node is still the leader");
             // let last_entry_id = self.node_services.tpu.get_state();
             self.validator_to_leader(tick_height, last_entry_id);
             FullnodeReturnType::LeaderToLeaderRotation
@@ -360,12 +364,12 @@ impl Fullnode {
     }
 
     pub fn validator_to_leader(&mut self, tick_height: u64, last_entry_id: Hash) {
-        trace!(
+        error!(
             "validator_to_leader({:?}): tick_height={} last_entry_id={}",
-            self.id,
-            tick_height,
-            last_entry_id,
+            self.id, tick_height, last_entry_id,
         );
+
+        assert!(self.bank.tick_height() >= tick_height); // xxxxxxxxx
 
         let (scheduled_leader, max_tick_height) = {
             let mut leader_scheduler = self.bank.leader_scheduler.write().unwrap();

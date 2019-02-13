@@ -66,6 +66,7 @@ impl ReplayStage {
         last_entry_id: &Arc<RwLock<Hash>>,
         entry_stream: Option<&mut EntryStream>,
     ) -> Result<()> {
+        error!("................... process_entries top");
         if let Some(stream) = entry_stream {
             stream.stream_entries(&entries).unwrap_or_else(|e| {
                 error!("Entry Stream error: {:?}, {:?}", e, stream.socket);
@@ -81,6 +82,7 @@ impl ReplayStage {
         let mut res = Ok(());
         let mut num_entries_to_write = entries.len();
         let now = Instant::now();
+        error!("................... process_entries pre verify");
         if !entries.as_slice().verify(&last_entry_id.read().unwrap()) {
             inc_new_counter_info!("replicate_stage-verify-fail", entries.len());
             return Err(Error::BlobError(BlobError::VerificationFailed));
@@ -90,6 +92,7 @@ impl ReplayStage {
             duration_as_ms(&now.elapsed()) as usize
         );
 
+        error!("................... process_entries pre get ticks");
         let mut num_ticks_to_next_vote = bank
             .leader_scheduler
             .read()
@@ -194,6 +197,7 @@ impl ReplayStage {
             .name("solana-replay-stage".to_string())
             .spawn(move || {
                 let _exit = Finalizer::new(exit_.clone());
+                error!("---------------- replay start --------");
                 let mut last_leader_id = Self::get_leader_for_next_tick(&bank);
                 let mut prev_slot = None;
                 let (mut current_slot, mut max_tick_height_for_slot) = {
@@ -211,8 +215,10 @@ impl ReplayStage {
                 // Loop through blocktree MAX_ENTRY_RECV_PER_ITER entries at a time for each
                 // relevant slot to see if there are any available updates
                 loop {
+                    error!("---------------- replay loop top--------");
                     // Stop getting entries if we get exit signal
                     if exit_.load(Ordering::Relaxed) {
+                        error!("replay stage is exiting...");
                         break;
                     }
 
@@ -249,6 +255,12 @@ impl ReplayStage {
                             vec![]
                         }
                     };
+                    error!(
+                        "replay stage processing entries for slot {:?}: len={:?} empty={:?}",
+                        current_slot,
+                        entries.len(),
+                        entries.is_empty()
+                    );
 
                     let entry_len = entries.len();
                     // Fetch the next entries from the database
@@ -263,9 +275,10 @@ impl ReplayStage {
                             &last_entry_id,
                             entry_stream.as_mut(),
                         ) {
-                            error!("process_entries failed: {:?}", e);
+                            error!("------------------- process_entries failed: {:?}", e);
                         }
 
+                        error!("---------------- replay finished process_entries --------");
                         let current_tick_height = bank.tick_height();
 
                         // We've reached the end of a slot, reset our state and check
@@ -294,13 +307,16 @@ impl ReplayStage {
                         }
                     }
 
+                    error!("---------------- Block until there are updates again --------");
                     // Block until there are updates again
                     if entry_len < MAX_ENTRY_RECV_PER_ITER && ledger_signal_receiver.recv().is_err()
                     {
                         // Update disconnected, exit
+                        error!("---------------- Update disconnected, exit--------");
                         break;
                     }
                 }
+                error!("---------------- replay exit--------");
             })
             .unwrap();
 

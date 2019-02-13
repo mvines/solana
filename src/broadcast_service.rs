@@ -60,6 +60,7 @@ impl Broadcast {
             num_entries += entries.len();
             ventries.push(entries);
         }
+        error!("broadcast run got entries: {:?}", ventries);
         let last_tick = {
             if let Some(Some(last)) = ventries.last().map(|entries| entries.last()) {
                 last.tick_height == self.max_tick_height
@@ -67,6 +68,7 @@ impl Broadcast {
                 false
             }
         };
+        error!("last_tick is {}", last_tick);
 
         inc_new_counter_info!("broadcast_service-entries_received", num_entries);
 
@@ -90,7 +92,10 @@ impl Broadcast {
 
         inc_new_counter_info!("streamer-broadcast-sent", blobs.len());
 
-        blob_sender.send(blobs.clone())?;
+        error!("$$$$ blob_sender.send: {:?}", blobs);
+        let r = blob_sender.send(blobs.clone());
+        error!("$$$$ blob_sender.sent:{:?}", r);
+        r?;
 
         // Send out data
         ClusterInfo::broadcast(&self.id, last_tick, &broadcast_table, sock, &blobs)?;
@@ -110,7 +115,7 @@ impl Broadcast {
             "broadcast_service-time_ms",
             duration_as_ms(&now.elapsed()) as usize
         );
-        info!(
+        error!(
             "broadcast: {} entries, blob time {} broadcast time {}",
             num_entries, to_blobs_elapsed, broadcast_elapsed
         );

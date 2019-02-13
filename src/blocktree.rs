@@ -595,6 +595,8 @@ impl Blocktree {
         self.db.write(write_batch)?;
         if should_signal {
             for signal in self.new_blobs_signals.iter() {
+                error!("^^^^^^^^^^^^^^^^^^^ blob signal ^^^^^^^^^");
+                //panic!("blob boom");
                 let _ = signal.try_send(true);
             }
         }

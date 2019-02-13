@@ -26,9 +26,12 @@ fn test_fullnode_transact_while_rotating_fast() {
         123,
     );
 
+    error!("leader_ledger_path: {}", leader_ledger_path);
+
     // Setup the cluster with a single node that attempts to leader rotate after every tick
     let mut fullnode_config = FullnodeConfig::default();
-    fullnode_config.leader_scheduler_config.ticks_per_slot = 1;
+    fullnode_config.leader_scheduler_config.ticks_per_slot = 3;
+    // fullnode_config.leader_scheduler_config.ticks_per_slot = 100000;
     let leader_fullnode = Fullnode::new(
         leader,
         &leader_keypair,
