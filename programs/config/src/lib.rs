@@ -109,7 +109,6 @@ mod tests {
         let config_account = create_config_account(42, 1);
 
         let mut new_config_state = ConfigState::new(42);
-        new_config_state.seq = 1;
         new_config_state.data[0] = 1;
 
         let transaction = ConfigTransaction::new_store(
@@ -134,8 +133,7 @@ mod tests {
         let mut config_account = create_config_account(42, 1);
         config_account.owner = Pubkey::default(); // <-- Invalid owner
 
-        let mut new_config_state = ConfigState::new(42);
-        new_config_state.seq = 1;
+        let new_config_state = ConfigState::new(42);
 
         let transaction = ConfigTransaction::new_store(
             &config_account_keypair,
