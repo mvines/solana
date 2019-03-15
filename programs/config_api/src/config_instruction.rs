@@ -1,5 +1,5 @@
-use crate::config_state::ConfigState;
 use crate::id;
+use crate::ConfigState;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::system_instruction::SystemInstruction;
 use solana_sdk::transaction_builder::BuilderInstruction;
@@ -7,25 +7,26 @@ use solana_sdk::transaction_builder::BuilderInstruction;
 pub struct ConfigInstruction {}
 
 impl ConfigInstruction {
-    pub fn new_config(
+    /// Create a new, empty configuration account
+    pub fn new_account<T: ConfigState>(
         from_account_pubkey: &Pubkey,
         config_account_pubkey: &Pubkey,
         lamports: u64,
-        data_len: u64,
     ) -> BuilderInstruction {
         SystemInstruction::new_program_account(
             from_account_pubkey,
             config_account_pubkey,
             lamports,
-            ConfigState::max_size(data_len),
+            T::max_space(),
             &id(),
         )
     }
 
-    pub fn new_store(
+    /// Store new data in a configuration account
+    pub fn new_store<T: ConfigState>(
         config_account_pubkey: &Pubkey,
-        config_state: &ConfigState,
+        data: &T,
     ) -> BuilderInstruction {
-        BuilderInstruction::new(id(), config_state, vec![(*config_account_pubkey, true)])
+        BuilderInstruction::new(id(), data, vec![(*config_account_pubkey, true)])
     }
 }
