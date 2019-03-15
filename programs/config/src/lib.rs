@@ -190,20 +190,13 @@ mod tests {
         let config_account_keypair = Keypair::new();
         let config_account = create_config_account();
 
-        let mut transaction = TransactionBuilder::default()
-            .push(SystemInstruction::new_move(
-                &system_account_keypair.pubkey(),
-                &Pubkey::default(),
-                42,
-            ))
-            .push(ConfigInstruction::new_store(
-                &config_account_keypair.pubkey(),
-                &MyConfig::new(42),
-            ))
-            .compile();
+        let mut transaction = TransactionBuilder::new_with_instructions(vec![
+            SystemInstruction::new_move(&system_account_keypair.pubkey(), &Pubkey::default(), 42),
+            ConfigInstruction::new_store(&config_account_keypair.pubkey(), &MyConfig::new(42)),
+        ]);
 
         // Don't sign the transaction with `config_account_keypair`
-        transaction.sign(&[&system_account_keypair], Hash::default());
+        transaction.sign_unchecked(&[&system_account_keypair], Hash::default());
         let mut accounts = vec![system_account, config_account];
         process_transaction(&transaction, &mut accounts).unwrap_err();
     }

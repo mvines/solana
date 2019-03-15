@@ -17,13 +17,15 @@ impl ConfigTransaction {
         lamports: u64,
         fee: u64,
     ) -> Transaction {
-        TransactionBuilder::new(fee)
+        let mut transaction = TransactionBuilder::new(fee)
             .push(ConfigInstruction::new_account::<T>(
                 &from_keypair.pubkey(),
                 config_account_pubkey,
                 lamports,
             ))
-            .sign(&[from_keypair], recent_blockhash)
+            .compile();
+        transaction.sign(&[from_keypair], recent_blockhash);
+        transaction
     }
 
     /// Store new state in a configuration account
@@ -33,11 +35,13 @@ impl ConfigTransaction {
         recent_blockhash: Hash,
         fee: u64,
     ) -> Transaction {
-        TransactionBuilder::new(fee)
+        let mut transaction = TransactionBuilder::new(fee)
             .push(ConfigInstruction::new_store(
                 &config_account_keypair.pubkey(),
                 data,
             ))
-            .sign(&[config_account_keypair], recent_blockhash)
+            .compile();
+        transaction.sign(&[config_account_keypair], recent_blockhash);
+        transaction
     }
 }
