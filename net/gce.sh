@@ -12,6 +12,8 @@ gce)
   # shellcheck source=net/scripts/gce-provider.sh
   source "$here"/scripts/gce-provider.sh
 
+  # NOTE: --min-cpu-platform "Intel Skylake" is hardcoded in
+  # gce-provider.sh's cloud_CreateInstances() implementation
   cpuBootstrapLeaderMachineType="--machine-type n1-standard-16"
   gpuBootstrapLeaderMachineType="$cpuBootstrapLeaderMachineType --accelerator count=4,type=nvidia-tesla-k80"
   bootstrapLeaderMachineType=$cpuBootstrapLeaderMachineType
@@ -23,12 +25,12 @@ ec2)
   # shellcheck source=net/scripts/ec2-provider.sh
   source "$here"/scripts/ec2-provider.sh
 
-  cpuBootstrapLeaderMachineType=m4.2xlarge
+  cpuBootstrapLeaderMachineType=c5.2xlarge
   gpuBootstrapLeaderMachineType=p2.xlarge
   bootstrapLeaderMachineType=$cpuBootstrapLeaderMachineType
   fullNodeMachineType=$cpuBootstrapLeaderMachineType
-  clientMachineType=m4.2xlarge
-  blockstreamerMachineType=m4.2xlarge
+  clientMachineType=c5.2xlarge
+  blockstreamerMachineType=c5.2xlarge
   ;;
 azure)
   # shellcheck source=net/scripts/azure-provider.sh

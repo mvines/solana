@@ -192,7 +192,7 @@ cloud_CreateInstances() {
 
   (
     set -x
-    gcloud beta compute instances create "${nodes[@]}" "${args[@]}"
+    gcloud beta compute instances create "${nodes[@]}" "${args[@]}" --min-cpu-platform "Intel Skylake"
   )
 }
 
