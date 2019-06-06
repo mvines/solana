@@ -224,10 +224,7 @@ fn main() {
         let entrypoint_addr = solana_netutil::parse_host_port(entrypoint)
             .expect("failed to parse entrypoint address");
         let ip_addr = solana_netutil::get_public_ip_addr(&entrypoint_addr).unwrap_or_else(|err| {
-            panic!(
-                "Unable to resolve IP address for {}: {}",
-                entrypoint_addr, err
-            )
+            panic!("Unable to contact entrypoint {}: {}", entrypoint_addr, err)
         });
         gossip_addr.set_ip(ip_addr);
 
