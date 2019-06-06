@@ -24,15 +24,21 @@ if [[ -z $CHANNEL_OR_TAG ]]; then
   exit 1
 fi
 
+PERF_LIBS=false
 case "$(uname)" in
 Darwin)
   TARGET=x86_64-apple-darwin
   ;;
 Linux)
   TARGET=x86_64-unknown-linux-gnu
+  PERF_LIBS=true
   ;;
 *)
-  TARGET=unknown-unknown-unknown
+  if [[ $OS = Windows_NT ]]; then
+    TARGET=x86_64-pc-windows-msvc
+  else
+    TARGET=unknown-unknown-unknown
+  fi
   ;;
 esac
 
@@ -53,18 +59,21 @@ echo --- Creating tarball
   source ci/rust-version.sh stable
   scripts/cargo-install-all.sh +"$rust_stable" solana-release
 
-  rm -rf target/perf-libs
-  ./fetch-perf-libs.sh
-  mkdir solana-release/target
-  cp -a target/perf-libs solana-release/target/
+  if $PERF_LIBS; then
+    rm -rf target/perf-libs
+    ./fetch-perf-libs.sh
+    mkdir solana-release/target
+    cp -a target/perf-libs solana-release/target/
 
-  # shellcheck source=/dev/null
-  source ./target/perf-libs/env.sh
-  (
-    cd validator
-    cargo +"$rust_stable" install --path . --features=cuda --root ../solana-release-cuda
-  )
-  cp solana-release-cuda/bin/solana-validator solana-release/bin/solana-validator-cuda
+    # shellcheck source=/dev/null
+    source ./target/perf-libs/env.sh
+    (
+      cd validator
+      cargo +"$rust_stable" install --path . --features=cuda --root ../solana-release-cuda
+    )
+    cp solana-release-cuda/bin/solana-validator solana-release/bin/solana-validator-cuda
+  fi
+
   cp -a scripts multinode-demo solana-release/
 
   # Add a wrapper script for validator.sh

@@ -1,0 +1,13 @@
+os:
+  - windows
+
+language: rust
+
+cache: cargo
+#    directories:
+#     - /home/travis/.cargo/
+
+script:
+  - echo scripts/cargo-install-all.sh solana-release
+  - ci/publish-tarball.sh
+
