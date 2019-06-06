@@ -125,7 +125,7 @@ where
         let short_len: ShortUsize = seq
             .next_element()?
             .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-        let len = short_len.0;
+        let len = dbg!(short_len.0);
 
         let mut result = Vec::with_capacity(len);
         for i in 0..len {

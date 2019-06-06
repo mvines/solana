@@ -530,6 +530,7 @@ impl Blob {
         trace!("receiving on {}", socket.local_addr().unwrap());
 
         let (nrecv, from) = socket.recv_from(&mut p.data)?;
+        trace!("recv_blob: {}", nrecv);
         p.meta.size = nrecv;
         p.meta.set_addr(&from);
         trace!("got {} bytes from {}", nrecv, from);

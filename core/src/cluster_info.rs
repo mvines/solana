@@ -1137,6 +1137,12 @@ impl ClusterInfo {
         blocktree: Option<&Arc<Blocktree>>,
         blob: &Blob,
     ) -> Vec<SharedBlob> {
+        error!(
+            "handle_blob: data.len={}, meta size={}",
+            blob.data.len(),
+            blob.meta.size
+        );
+
         deserialize(&blob.data[..blob.meta.size])
             .into_iter()
             .flat_map(|request| {
