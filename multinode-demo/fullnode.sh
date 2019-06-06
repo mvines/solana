@@ -314,7 +314,7 @@ elif [[ $node_type = validator ]]; then
   [[ -r "$storage_keypair_path" ]] || $solana_keygen -o "$storage_keypair_path"
 
   default_arg --entrypoint "$entrypoint_address"
-  default_arg --rpc-drone-address "${entrypoint_address%:*}:9900"
+  default_arg --rpc-drone-address "testnet.solana.com:9900"
 
   rsync_entrypoint_url=$(rsync_url "$entrypoint")
 else
