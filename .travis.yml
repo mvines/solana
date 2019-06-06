@@ -1,5 +1,6 @@
 os:
   - windows
+  - osx
 
 language: rust
 
@@ -8,6 +9,7 @@ cache: cargo
 #     - /home/travis/.cargo/
 
 script:
+  - source ci/env.sh
   - echo scripts/cargo-install-all.sh solana-release
   - ci/publish-tarball.sh
 

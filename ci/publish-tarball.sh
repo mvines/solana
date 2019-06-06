@@ -25,20 +25,19 @@ if [[ -z $CHANNEL_OR_TAG ]]; then
 fi
 
 PERF_LIBS=false
-case "$(uname)" in
-Darwin)
+case "$CI_OS_NAME" in
+osx)
   TARGET=x86_64-apple-darwin
   ;;
-Linux)
+linux)
   TARGET=x86_64-unknown-linux-gnu
   PERF_LIBS=true
   ;;
+windows)
+  TARGET=x86_64-pc-windows-msvc
+  ;;
 *)
-  if [[ $OS = Windows_NT ]]; then
-    TARGET=x86_64-pc-windows-msvc
-  else
-    TARGET=unknown-unknown-unknown
-  fi
+  TARGET=unknown-unknown-unknown
   ;;
 esac
 

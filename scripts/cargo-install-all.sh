@@ -30,9 +30,6 @@ SECONDS=0
 )
 
 BIN_CRATES=(
-  bench-exchange
-  bench-streamer
-  bench-tps
   drone
   genesis
   gossip
@@ -43,6 +40,15 @@ BIN_CRATES=(
   validator
   wallet
 )
+
+if [[ -z $CI || $CI_OS_NAME = linux ]]; then
+  # Only ship for Linux
+  BIN_CRATES+=(
+    bench-exchange
+    bench-streamer
+    bench-tps
+  )
+fi
 
 for crate in "${BIN_CRATES[@]}"; do
   (
