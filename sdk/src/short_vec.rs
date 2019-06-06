@@ -3,8 +3,8 @@ use serde::ser::{self, SerializeTuple, Serializer};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::marker::PhantomData;
-use std::mem::size_of;
 
+/*
 /// Same as u16, but serialized with 1 to 3 bytes. If the value is above
 /// 0x7f, the top bit is set and the remaining value is stored in the next
 /// bytes. Each byte follows the same pattern until the 3rd byte. The 3rd
@@ -50,26 +50,32 @@ impl<'de> Visitor<'de> for ShortLenVisitor {
     where
         A: SeqAccess<'de>,
     {
-        let mut len = 0;
+        let mut len: usize = 0;
         let mut size = 0;
         loop {
             let elem: u8 = seq
                 .next_element()?
                 .ok_or_else(|| de::Error::invalid_length(size, &self))?;
 
-            len |= (elem as u16 & 0x7f) << (size * 7);
+            dbg!(size);
+            dbg!(size * 7);
+            len |= (elem as usize & 0x7f) << (size * 7);
+            dbg!("here");
             size += 1;
+            dbg!("here2");
 
             if elem as u16 & 0x80 == 0 {
                 break;
             }
 
             if size > size_of::<u16>() + 1 {
+                dbg!("here4");
+                dbg!(size);
                 return Err(de::Error::invalid_length(size, &self));
             }
         }
-
-        Ok(ShortUsize(len))
+        dbg!("here3");
+        Ok(ShortUsize(len as u16))
     }
 }
 
@@ -81,6 +87,7 @@ impl<'de> Deserialize<'de> for ShortUsize {
         deserializer.deserialize_tuple(9, ShortLenVisitor)
     }
 }
+*/
 
 /// If you don't want to use the ShortVec newtype, you can do ShortVec
 /// serialization on an ordinary vector with the following field annotation:
@@ -96,11 +103,10 @@ pub fn serialize<S: Serializer, T: Serialize>(
     let mut seq = serializer.serialize_tuple(1)?;
 
     let len = elements.len();
-    if len > std::u16::MAX as usize {
+    if len > std::u8::MAX as usize {
         return Err(ser::Error::custom("length too large"));
     }
-
-    let short_len = ShortUsize(len as u16);
+    let short_len = len as u8;
     seq.serialize_element(&short_len)?;
 
     for element in elements {
@@ -127,10 +133,10 @@ where
     where
         A: SeqAccess<'de>,
     {
-        let short_len: ShortUsize = seq
+        let short_len: u8 = seq
             .next_element()?
             .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-        let len = short_len.0 as usize;
+        let len = short_len as usize;
 
         let mut result = Vec::with_capacity(len);
         for i in 0..len {
@@ -179,9 +185,9 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for ShortVec<T> {
 
 /// Return the decoded value and how many bytes it consumed.
 pub fn decode_len(bytes: &[u8]) -> (usize, usize) {
-    let short_len: ShortUsize = bincode::deserialize(bytes).unwrap();
+    let short_len: u8 = bincode::deserialize(bytes).unwrap();
     let num_bytes = bincode::serialized_size(&short_len).unwrap() as u16;
-    (short_len.0 as usize, num_bytes as usize)
+    (short_len as usize, num_bytes as usize)
 }
 
 #[cfg(test)]
@@ -190,12 +196,12 @@ mod tests {
     use bincode::{deserialize, serialize};
 
     /// Return the serialized length.
-    fn encode_len(len: u16) -> Vec<u8> {
-        bincode::serialize(&ShortUsize(len)).unwrap()
+    fn encode_len(len: u8) -> Vec<u8> {
+        bincode::serialize(&len).unwrap()
     }
 
-    fn assert_len_encoding(len: u16, bytes: &[u8]) {
-        assert_eq!(encode_len(len), bytes, "unexpected u16 encoding");
+    fn assert_len_encoding(len: u8, bytes: &[u8]) {
+        assert_eq!(encode_len(len), bytes, "unexpected u8 encoding");
         assert_eq!(
             decode_len(bytes),
             (len as usize, bytes.len()),
@@ -207,11 +213,8 @@ mod tests {
     fn test_short_vec_encode_len() {
         assert_len_encoding(0x0, &[0x0]);
         assert_len_encoding(0x7f, &[0x7f]);
-        assert_len_encoding(0x80, &[0x80, 0x01]);
-        assert_len_encoding(0xff, &[0xff, 0x01]);
-        assert_len_encoding(0x100, &[0x80, 0x02]);
-        assert_len_encoding(0x7fff, &[0xff, 0xff, 0x01]);
-        assert_len_encoding(0xffff, &[0xff, 0xff, 0x03]);
+        assert_len_encoding(0x80, &[0x80]);
+        assert_len_encoding(0xff, &[0xff]);
     }
 
     #[test]
@@ -232,8 +235,8 @@ mod tests {
 
     #[test]
     fn test_short_vec_json() {
-        let vec = ShortVec(vec![0u8]);
+        let vec = ShortVec(vec![0, 1, 2]);
         let s = serde_json::to_string(&vec).unwrap();
-        assert_eq!(s, "[[1],0]");
+        assert_eq!(s, "[3,0,1,2]");
     }
 }
