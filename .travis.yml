@@ -1,6 +1,6 @@
 os:
-  - windows
   - osx
+  - windows
 
 language: rust
 cache: cargo
@@ -15,3 +15,21 @@ script:
   - source ci/env.sh
   - ci/publish-tarball.sh
 
+
+deploy:
+  - provider: s3
+    access_key_id: $AWS_ACCESS_KEY_ID
+    secret_access_key: $AWS_SECRET_ACCESS_KEY
+    bucket: solana-release
+    region: us-east-1
+    skip_cleanup: true
+    acl: public_read
+    local_dir: travis-s3-upload
+  - provider: releases
+    api_key: $GITHUB_TOKEN
+    file: "FILE TO UPLOAD"
+    skip_cleanup: true
+    file_glob: true
+    file: travis-$TRAVIS_TAG-upload/*
+    on:
+      tags: true
