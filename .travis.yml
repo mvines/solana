@@ -28,13 +28,13 @@ deploy:
     region: us-west-1
     skip_cleanup: true
     acl: public_read
-    local_dir: travis-s3-upload
+    local_dir: s3-upload
     on:
       all_branches: true
   - provider: releases
     api_key: $GITHUB_TOKEN
     skip_cleanup: true
     file_glob: true
-    file: travis-$TRAVIS_TAG-upload/*
+    file: release-upload/*
     on:
       tags: true

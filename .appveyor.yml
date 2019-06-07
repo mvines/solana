@@ -1,0 +1,39 @@
+os: Visual Studio 2017
+clone_depth: 10
+
+build_script:
+  - bash ./appveyor.sh
+
+deploy:
+  - provider: S3
+    access_key_id:
+      secure: ptvqM/yvgeTeA12XOzybH1KYNh95AdfEvqoH9mvP2ic=
+    secret_access_key:
+      secure: IkrgBlz5hdxvwcJdMXyyHUrpWhKa6fXLOD/8rm/rjKqYCdrba9B8V1nLZVrzXGGy
+    bucket: release.solana.com
+    region: us-west-1
+    set_public: true
+    local_dir: s3-upload
+
+  - provider: Github
+    api_key:
+      secure: vQ3jMl5LQrit6+TQONA3ZgQjZ/Ej62BN2ReVb2NSOwjITHMu1131hjc3dOrMEZL6
+    artifact: release-upload\*.*
+    draft: false
+    prerelease: false
+    on:
+      APPVEYOR_REPO_TAG: true
+
+
+      #
+      #  # Slack
+      #   - provider: Slack
+      #     incoming_webhook: http://incoming-webhook-url
+      #
+      #   # ...or using auth token
+      #
+      #   - provider: Slack
+      #     auth_token:
+      #       secure: kBl9BlxvRMr9liHmnBs14A==
+      #     channel: development
+      #     template: "{message}, {commitId}, ..."
