@@ -22,10 +22,9 @@ deploy:
     region: us-west-1
     set_public: true
 
-  - provider: Github
-    api_key:
+  - provider: GitHub
+    auth_token:
       secure: vQ3jMl5LQrit6+TQONA3ZgQjZ/Ej62BN2ReVb2NSOwjITHMu1131hjc3dOrMEZL6
-    artifact: release-upload\*.*
     draft: false
     prerelease: false
     on:
