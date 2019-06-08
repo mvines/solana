@@ -142,9 +142,7 @@ for file in solana-release-$TARGET.tar.bz2 solana-install-$TARGET; do
       cp -v $file release-upload/
     fi
   elif [[ -n $APPVEYOR ]]; then
-    mkdir "$CHANNEL_OR_TAG"
-    cp -v $file "$CHANNEL_OR_TAG"/
-    appveyor PushArtifact "$CHANNEL_OR_TAG"/$file
+    appveyor PushArtifact $file -FileName "$CHANNEL_OR_TAG"/$file
   fi
 done
 
