@@ -45,7 +45,7 @@ echo --- Creating tarball
 (
   set -x
   rm -rf solana-release/
-  mkdir solana-release/
+  mkdir -p solana-release/bin
 
   COMMIT="$(git rev-parse HEAD)"
 
@@ -55,9 +55,10 @@ echo --- Creating tarball
     echo "target: $TARGET"
   ) > solana-release/version.yml
 
-  source ci/rust-version.sh stable
-  scripts/cargo-install-all.sh +"$rust_stable" solana-release
-
+  #source ci/rust-version.sh stable
+  #scripts/cargo-install-all.sh +"$rust_stable" solana-release
+  echo "hi" > solana-release/bin/solana-install
+https://hooks.slack.com/services/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
   if $PERF_LIBS; then
     rm -rf target/perf-libs
     ./fetch-perf-libs.sh
