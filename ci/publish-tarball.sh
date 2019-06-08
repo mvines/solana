@@ -130,8 +130,8 @@ for file in solana-release-$TARGET.tar.bz2 solana-install-$TARGET; do
     if [[ -n $TAG ]]; then
       ci/upload-github-release-asset.sh $file
     fi
-  elif [[ -n $TRAVIS || -n $APPVEYOR ]]; then
-    # .travis.yaml/.appveyor uploads everything in the s3-upload/ directory to release.solana.com
+  elif [[ -n $TRAVIS ]]; then
+    # .travis.yam uploads everything in the s3-upload/ directory to release.solana.com
     mkdir -p s3-upload/"$CHANNEL_OR_TAG"
     cp -v $file s3-upload/"$CHANNEL_OR_TAG"/
 
@@ -141,6 +141,10 @@ for file in solana-release-$TARGET.tar.bz2 solana-install-$TARGET; do
       mkdir -p release-upload/
       cp -v $file release-upload/
     fi
+  elif [[ -n $APPVEYOR ]]; then
+    mkdir "$CHANNEL_OR_TAG"
+    cp -v $file "$CHANNEL_OR_TAG"/
+    appveyor PushArtifact "$CHANNEL_OR_TAG"/$file
   fi
 done
 

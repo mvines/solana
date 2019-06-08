@@ -1,5 +1,4 @@
 os: Visual Studio 2017
-clone_depth: 10
 
 build_script:
   - bash ./appveyor.sh
@@ -13,6 +12,9 @@ notifications:
     on_build_failure: true
     on_build_status_changed: true
 
+artifacts:
+  - path: 's3-upload\**\*.*'
+
 deploy:
   - provider: S3
     access_key_id:
@@ -22,7 +24,6 @@ deploy:
     bucket: release.solana.com
     region: us-west-1
     set_public: true
-    local_dir: s3-upload
 
   - provider: Github
     api_key:
@@ -31,7 +32,7 @@ deploy:
     draft: false
     prerelease: false
     on:
-      APPVEYOR_REPO_TAG: true
+      appveyor_repo_tag: true
 
 
       #
