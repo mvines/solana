@@ -4,6 +4,15 @@ clone_depth: 10
 build_script:
   - bash ./appveyor.sh
 
+notifications:
+  - provider: Slack
+    incoming_webhook:
+      secure: 6HTXVh+FBz29LGJb+taFOo9dqoADfo9xyAszeyXZF5Ub9t5NERytKAR35B2wb+uIOOCBF8+JhmH4437Cgf/ti4IqvURzW1QReXK7eQhn1EI=
+    channel: ci-status
+    on_build_success: false
+    on_build_failure: true
+    on_build_status_changed: true
+
 deploy:
   - provider: S3
     access_key_id:
