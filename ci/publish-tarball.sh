@@ -58,8 +58,7 @@ echo --- Creating tarball
   #source ci/rust-version.sh stable
   #scripts/cargo-install-all.sh +"$rust_stable" solana-release
   echo "hi" > solana-release/bin/solana-install
-https://hooks.slack.com/services/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
-  if $PERF_LIBS; then
+  if false; then
     rm -rf target/perf-libs
     ./fetch-perf-libs.sh
     mkdir solana-release/target
