@@ -12,9 +12,6 @@ notifications:
     on_build_failure: true
     on_build_status_changed: true
 
-artifacts:
-  - path: 's3-upload\**\*.*'
-
 deploy:
   - provider: S3
     access_key_id:
