@@ -380,7 +380,8 @@ pub fn fund_keys<T: Client>(
         //  assume 4MB network buffers, and 512 byte packets
         const FUND_CHUNK_LEN: usize = 4 * 1024 * 1024 / 512;
 
-        to_fund.chunks(FUND_CHUNK_LEN).for_each(|chunk| {
+        println!("to_fund len: {}", to_fund.len());
+        to_fund.chunks(dbg!(FUND_CHUNK_LEN)).for_each(|chunk| {
             let mut tries = 0;
 
             // this set of transactions just initializes us for bookkeeping
@@ -398,7 +399,7 @@ pub fn fund_keys<T: Client>(
                 })
                 .collect();
 
-            let amount = chunk[0].1[0].1;
+            let amount = dbg!(chunk[0].1[0].1);
 
             while !to_fund_txs.is_empty() {
                 let receivers = to_fund_txs
