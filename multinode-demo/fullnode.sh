@@ -176,6 +176,9 @@ while [[ -n $1 ]]; do
     if [[ $1 = --label ]]; then
       label="-$2"
       shift 2
+    elif [[ $1 = --ledger ]]; then
+      ledger_config_dir="$2"
+      shift 2
     elif [[ $1 = --no-restart ]]; then
       no_restart=1
       shift
@@ -259,7 +262,7 @@ if [[ $node_type = replicator ]]; then
   [[ -r "$identity_keypair_path" ]] || $solana_keygen new -o "$identity_keypair_path"
 
   storage_keypair_path="$SOLANA_CONFIG_DIR"/replicator-storage-keypair$label.json
-  ledger_config_dir=$SOLANA_CONFIG_DIR/replicator-ledger$label
+  : "${ledger_config_dir:=$SOLANA_CONFIG_DIR/replicator-ledger$label}"
   configured_flag=$SOLANA_CONFIG_DIR/replicator$label.configured
 
   program=$solana_replicator
@@ -278,12 +281,12 @@ elif [[ $node_type = bootstrap_leader ]]; then
   [[ -f "$SOLANA_CONFIG_DIR"/bootstrap-leader-keypair.json ]] ||
     ledger_not_setup "$SOLANA_CONFIG_DIR/bootstrap-leader-keypair.json not found"
 
-  $solana_ledger_tool --ledger "$SOLANA_CONFIG_DIR"/bootstrap-leader-ledger verify
-
   : "${identity_keypair_path:=$SOLANA_CONFIG_DIR/bootstrap-leader-keypair.json}"
+  : "${ledger_config_dir:=$SOLANA_CONFIG_DIR/bootstrap-leader-ledger}"
+
+  $solana_ledger_tool --ledger "$ledger_config_dir" verify
 
   vote_keypair_path="$SOLANA_CONFIG_DIR"/bootstrap-leader-vote-keypair.json
-  ledger_config_dir="$SOLANA_CONFIG_DIR"/bootstrap-leader-ledger
   state_dir="$SOLANA_CONFIG_DIR"/bootstrap-leader-state
   stake_keypair_path=$SOLANA_CONFIG_DIR/bootstrap-leader-stake-keypair.json
   storage_keypair_path=$SOLANA_CONFIG_DIR/bootstrap-leader-storage-keypair.json
@@ -308,7 +311,7 @@ elif [[ $node_type = validator ]]; then
   [[ -r "$identity_keypair_path" ]] || $solana_keygen new -o "$identity_keypair_path"
 
   vote_keypair_path=$SOLANA_CONFIG_DIR/validator-vote-keypair$label.json
-  ledger_config_dir=$SOLANA_CONFIG_DIR/validator-ledger$label
+  : "${ledger_config_dir:=$SOLANA_CONFIG_DIR/validator-ledger$label}"
   state_dir="$SOLANA_CONFIG_DIR"/validator-state$label
   stake_keypair_path=$SOLANA_CONFIG_DIR/validator-stake-keypair$label.json
   storage_keypair_path=$SOLANA_CONFIG_DIR/validator-storage-keypair$label.json
