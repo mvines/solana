@@ -110,7 +110,7 @@ exec multinode-demo/clear-config.sh "$@"
 EOF
   chmod +x solana-release/bin/clear-config.sh
 
-  tar jvcf solana-release-$TARGET.tar.bz2 solana-release/
+  tar jvcf solana-release-$TARGET.tar.bz2 solana-release
   cp solana-release/bin/solana-install-init solana-install-init-$TARGET
 )
 
