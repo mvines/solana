@@ -110,8 +110,10 @@ exec multinode-demo/clear-config.sh "$@"
 EOF
   chmod +x solana-release/bin/clear-config.sh
 
-  tar jvcf solana-release-$TARGET.tar.bz2 solana-release
+  tar cvf solana-release-$TARGET.tar solana-release
+  bzip2 solana-release-$TARGET.tar
   cp solana-release/bin/solana-install-init solana-install-init-$TARGET
+  echo done
 )
 
 # Metrics tarball is platform agnostic, only publish it from Linux
