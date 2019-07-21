@@ -4,6 +4,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 if [[ -n $APPVEYOR ]]; then
+  set
   # Bootstrap rust build environment
   source ci/env.sh
   source ci/rust-version.sh
@@ -13,6 +14,10 @@ if [[ -n $APPVEYOR ]]; then
   export PATH="$PATH:$USERPROFILE/.cargo/bin"
   rustc -vV
   cargo -vV
+
+  date > foo
+  appveyor PushArtifact foo -FileName foo
+  exit 0
 fi
 
 DRYRUN=
@@ -70,6 +75,13 @@ echo --- Creating tarball
 
   source ci/rust-version.sh stable
   scripts/cargo-install-all.sh +"$rust_stable" solana-release
+
+  # Hack to reduce the archive size until
+  # https://github.com/appveyor/ci/issues/2997 is fixed
+  if [[ -n $APPVEYOR ]]; then
+    rm -f solana-release/bin/solana-validator.exe
+    rm -f solana-release/bin/solana-bench-exchange.exe
+  fi
 
   if $PERF_LIBS; then
     rm -rf target/perf-libs
