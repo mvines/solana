@@ -1004,18 +1004,18 @@ impl ClusterInfo {
             if let Ok(Some(mut blob)) = blob {
                 inc_new_counter_debug!("cluster_info-window-request-ledger", 1);
                 blob.meta.set_addr(from_addr);
-
+                info!(
+                    "{}: success RequestWindowIndex {} {} {}",
+                    me.id, from.id, slot, blob_index,
+                );
                 return vec![Arc::new(RwLock::new(blob))];
             }
         }
 
         inc_new_counter_debug!("cluster_info-window-request-fail", 1);
-        trace!(
+        info!(
             "{}: failed RequestWindowIndex {} {} {}",
-            me.id,
-            from.id,
-            slot,
-            blob_index,
+            me.id, from.id, slot, blob_index,
         );
 
         vec![]
