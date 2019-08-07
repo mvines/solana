@@ -44,7 +44,6 @@ no_restart=0
 # TODO: Enable boot_from_snapshot when snapshots work
 #boot_from_snapshot=1
 boot_from_snapshot=0
-reset_ledger=0
 gossip_entrypoint=
 ledger_dir=
 
@@ -114,9 +113,6 @@ while [[ -n $1 ]]; do
       shift 2
     elif [[ $1 = --no-airdrop ]]; then
       airdrops_enabled=0
-      shift
-    elif [[ $1 = --reset-ledger ]]; then
-      reset_ledger=1
       shift
     elif [[ $1 = --ledger ]]; then
       ledger_dir=$2
@@ -244,15 +240,6 @@ kill_node_and_exit() {
   exit
 }
 trap 'kill_node_and_exit' INT TERM ERR
-
-if ((reset_ledger)); then
-  echo "Resetting ledger..."
-  (
-    set -x
-    rm -rf "$ledger_dir"
-  )
-fi
-
 
 wallet() {
   (
