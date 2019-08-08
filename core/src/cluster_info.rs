@@ -1005,8 +1005,8 @@ impl ClusterInfo {
                 inc_new_counter_debug!("cluster_info-window-request-ledger", 1);
                 blob.meta.set_addr(from_addr);
                 info!(
-                    "{}: success RequestWindowIndex {} {} {}",
-                    me.id, from.id, slot, blob_index,
+                    "{}: success RequestWindowIndex {} {} {} size={} from_addr={}",
+                    me.id, from.id, slot, blob_index, blob.meta.size, from_addr,
                 );
                 return vec![Arc::new(RwLock::new(blob))];
             }
