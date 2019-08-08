@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 pub const VOTE_THRESHOLD_DEPTH: usize = 8;
 pub const VOTE_THRESHOLD_SIZE: f64 = 2f64 / 3f64;
-pub const MAX_RECENT_VOTES: usize = 16;
+pub const MAX_RECENT_VOTES: usize = 8;
 
 #[derive(Default)]
 pub struct EpochStakes {
