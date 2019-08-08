@@ -246,6 +246,7 @@ impl Validator {
                 .map(|s| s.try_clone().expect("Failed to clone TVU Sockets"))
                 .collect(),
         };
+        info!("node sockets: {:?}", sockets);
 
         let voting_keypair = if config.voting_disabled {
             None

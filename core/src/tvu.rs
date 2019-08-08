@@ -45,6 +45,7 @@ pub struct Tvu {
     snapshot_packager_service: Option<SnapshotPackagerService>,
 }
 
+#[derive(Debug)]
 pub struct Sockets {
     pub fetch: Vec<UdpSocket>,
     pub repair: UdpSocket,
