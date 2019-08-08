@@ -133,7 +133,16 @@ where
         Err(e) => Err(e),
     }?;
 
-    trace!("{} num blobs received: {}", my_pubkey, blobs.len());
+    info!("{} num blobs received: {}", my_pubkey, blobs.len());
+    for blob in &blobs {
+        let blob = blob.read().unwrap();
+        info!(
+            "recv_window: got blob: {:?} slot={} index={}",
+            blob,
+            blob.slot(),
+            blob.index()
+        );
+    }
 
     process_blobs(&blobs, blocktree)?;
 

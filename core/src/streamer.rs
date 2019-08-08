@@ -105,14 +105,15 @@ pub fn responder(name: &'static str, sock: Arc<UdpSocket>, r: BlobReceiver) -> J
 //window.
 fn recv_blobs(sock: &UdpSocket, s: &BlobSender) -> Result<()> {
     trace!("recv_blobs: receiving on {}", sock.local_addr().unwrap());
-    let dq = Blob::recv_from(sock)?;
-    if !dq.is_empty() {
-        info!(
-            "recv_blobs: received on {}: {:?}",
-            sock.local_addr().unwrap(),
-            dq
-        );
-        s.send(dq)?;
+    if let Ok(dq) = Blob::recv_from(sock) {
+        if !dq.is_empty() {
+            info!(
+                "recv_blobs: received on {}: {:?}",
+                sock.local_addr().unwrap(),
+                dq
+            );
+            s.send(dq)?;
+        }
     }
     Ok(())
 }
@@ -134,7 +135,10 @@ pub fn blob_receiver(
             if exit.load(Ordering::Relaxed) {
                 break;
             }
-            let _ = recv_blobs(&sock, &s);
+            let r = recv_blobs(&sock, &s);
+            if r.is_err() {
+                error!("recv_blobs failed: {:?}", r);
+            }
         })
         .unwrap()
 }
