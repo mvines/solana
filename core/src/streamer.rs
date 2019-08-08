@@ -107,6 +107,11 @@ fn recv_blobs(sock: &UdpSocket, s: &BlobSender) -> Result<()> {
     trace!("recv_blobs: receiving on {}", sock.local_addr().unwrap());
     let dq = Blob::recv_from(sock)?;
     if !dq.is_empty() {
+        info!(
+            "recv_blobs: received on {}: {:?}",
+            sock.local_addr().unwrap(),
+            dq
+        );
         s.send(dq)?;
     }
     Ok(())
