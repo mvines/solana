@@ -119,7 +119,7 @@ impl Tower {
                         confirmation_count: MAX_LOCKOUT_HISTORY as u32,
                         slot: root,
                     };
-                    trace!("ROOT: {}", vote.slot);
+                    info!("ROOT: {}", vote.slot);
                     Self::update_ancestor_lockouts(&mut stake_lockouts, &vote, ancestors);
                 }
             }
@@ -166,7 +166,7 @@ impl Tower {
     }
 
     pub fn record_vote(&mut self, slot: u64, hash: Hash) -> Option<u64> {
-        trace!("{} record_vote for {}", self.node_pubkey, slot);
+        info!("{} record_vote for {}", self.node_pubkey, slot);
         let root_slot = self.lockouts.root_slot;
         let vote = Vote { slot, hash };
         self.lockouts.process_vote_unchecked(&vote);
@@ -225,9 +225,10 @@ impl Tower {
     }
 
     pub fn is_locked_out(&self, slot: u64, descendants: &HashMap<u64, HashSet<u64>>) -> bool {
-        let mut lockouts = self.lockouts.clone();
+        let mut lockouts = dbg!(self.lockouts.clone());
         lockouts.process_slot_vote_unchecked(slot);
         for vote in &lockouts.votes {
+            info!("is_locked_out: vote.slot={}", vote.slot);
             if vote.slot == slot {
                 continue;
             }
@@ -345,18 +346,19 @@ impl Tower {
             if let Some((_stake, vote_account)) = bank.vote_accounts().get(vote_account_pubkey) {
                 let vote_state = VoteState::deserialize(&vote_account.data)
                     .expect("vote_account isn't a VoteState?");
-                trace!(
+                info!(
                     "{} lockouts initialized to {:?}",
-                    self.node_pubkey,
-                    vote_state
+                    self.node_pubkey, vote_state
                 );
 
                 assert_eq!(
                     vote_state.node_pubkey, self.node_pubkey,
                     "vote account's node_pubkey doesn't match",
                 );
-                self.lockouts = vote_state;
+                self.lockouts = dbg!(vote_state);
             }
+        } else {
+            info!("initialize_lockouts_from_bank_forks: no heavy bank!");
         }
     }
 }

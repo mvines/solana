@@ -22,6 +22,7 @@ use solana_sdk::timing::{self, duration_as_ms};
 use solana_sdk::transaction::Transaction;
 use solana_vote_api::vote_instruction;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -103,11 +104,14 @@ impl ReplayStage {
         let subscriptions = subscriptions.clone();
         let bank_forks = bank_forks.clone();
         let poh_recorder = poh_recorder.clone();
-        let my_pubkey = *my_pubkey;
+
+        let my_pubkey = Pubkey::from_str("9hhrtfrDFSeqkTeGf4EW85Q4ED42mP8Tv3YU6x3Ri5Ss").unwrap(); // *my_pubkey;
+        let vote_account =
+            Pubkey::from_str("237U7NmeMeZuv7th647EPGYx7XN1gLE9V3cEY56Lb8tX").unwrap();
         let mut tower = Tower::new(&my_pubkey, &vote_account, &bank_forks.read().unwrap());
         // Start the replay stage loop
         let leader_schedule_cache = leader_schedule_cache.clone();
-        let vote_account = *vote_account;
+        //let vote_account = *vote_account;
         let voting_keypair = voting_keypair.cloned();
 
         let (lockouts_sender, t_lockouts) = aggregate_stake_lockouts(exit);
@@ -572,7 +576,7 @@ impl ReplayStage {
     ) -> Vec<(u128, Arc<Bank>, HashMap<u64, StakeLockout>, u64)> {
         let tower_start = Instant::now();
         // Tower voting
-        let descendants = bank_forks.read().unwrap().descendants();
+        let descendants = dbg!(bank_forks.read().unwrap().descendants());
         let ancestors = bank_forks.read().unwrap().ancestors();
         let frozen_banks = bank_forks.read().unwrap().frozen_banks();
 
@@ -636,6 +640,8 @@ impl ReplayStage {
             );
         }
         inc_new_counter_info!("replay_stage-tower_duration", ms as usize);
+
+        panic!("oof");
 
         votable
     }
