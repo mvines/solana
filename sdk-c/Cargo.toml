@@ -19,7 +19,7 @@ libc = "0.2.62"
 rand_chacha = "0.1.1"
 rand_core = { version = ">=0.2, <0.4", default-features = false }
 solana-sdk = { path = "../sdk", version = "0.19.0-pre0" }
-solana-ed25519-dalek = { version = "0.2.0", features = ["serde"]}
+solana-ed25519-dalek = "0.2.0"
 
 [build-dependencies]
 cbindgen = "0.9.1"
