@@ -153,6 +153,116 @@ impl Validator {
             config.dev_halt_at_slot,
         );
 
+        {
+            use solana_sdk::native_token::lamports_to_sol;
+            use solana_vote_api::vote_state::VoteState;
+            use std::collections::{HashMap, HashSet};
+            use std::io::Write;
+
+            let mut dot = vec!["digraph {".to_string()];
+
+            // Build a subgraph consisting of all banks and links to their parent banks
+            dot.push("  subgraph cluster_banks {".to_string());
+            dot.push("    style=invis".to_string());
+            let mut styled_slots = HashSet::new();
+            for bfi in &bank_forks_info {
+                let bank = bank_forks.banks.get(&bfi.bank_slot).unwrap();
+                let mut bank = bank.clone();
+
+                let mut first = true;
+                loop {
+                    if !styled_slots.contains(&bank.slot()) {
+                        dot.push(format!(
+                            r#"    "{}"[label="{} (epoch {})\nleader: {}",style="{}{}"];"#,
+                            bank.slot(),
+                            bank.slot(),
+                            bank.epoch(),
+                            bank.collector_id(),
+                            if first { "filled," } else { "" },
+                            if !bank.is_votable() { "dotted," } else { "" }
+                        ));
+                        styled_slots.insert(bank.slot());
+                    }
+                    first = false;
+
+                    match bank.parent() {
+                        None => {
+                            dot.push(format!(r#"    "{}" -> "...""#, bank.slot(),));
+                            break;
+                        }
+                        Some(parent) => {
+                            let slot_distance = bank.slot() - parent.slot();
+                            let penwidth = if bank.epoch() > parent.epoch() {
+                                "5"
+                            } else {
+                                "1"
+                            };
+                            let link_label = if slot_distance > 1 {
+                                format!("label=\"{} slots\",color=red", slot_distance)
+                            } else {
+                                "color=blue".to_string()
+                            };
+                            dot.push(format!(
+                                r#"    "{}" -> "{}"[{},penwidth={}];"#,
+                                bank.slot(),
+                                parent.slot(),
+                                link_label,
+                                penwidth
+                            ));
+
+                            bank = parent.clone();
+                        }
+                    }
+                }
+            }
+            dot.push("  }".to_string());
+
+            // Search all forks for the last vote by each validator
+            let mut last_votes = HashMap::new();
+            for bfi in &bank_forks_info {
+                let bank = bank_forks.banks.get(&bfi.bank_slot).unwrap();
+
+                for (_, (stake, vote_account)) in bank.vote_accounts() {
+                    let vote_state = VoteState::from(&vote_account).unwrap_or_default();
+                    if let Some(last_vote) = vote_state.votes.iter().last() {
+                        let entry = last_votes
+                            .entry(vote_state.node_pubkey)
+                            .or_insert((0, None, 0));
+                        if entry.0 < last_vote.slot {
+                            *entry = (last_vote.slot, vote_state.root_slot, stake);
+                        }
+                    }
+                }
+            }
+
+            // Strafe the banks with links from validators to the bank they last voted on
+            for (node_pubkey, (last_vote_slot, root_slot, stake)) in &last_votes {
+                dot.push(format!(
+                    r#"  "{}"[shape=box,label="validator: {}\nstake: {} SOL\nlast vote slot: {}\nroot slot: {}"];"#,
+                    node_pubkey,
+                    node_pubkey,
+                    lamports_to_sol(*stake),
+                    last_vote_slot,
+                    root_slot.unwrap_or(0)
+                ));
+                dot.push(format!(
+                    r#"  "{}" -> "{}" [style=dotted,label="last vote"];"#,
+                    node_pubkey,
+                    if styled_slots.contains(&last_vote_slot) {
+                        last_vote_slot.to_string()
+                    } else {
+                        "...".to_string()
+                    }
+                ));
+            }
+
+            dot.push("}".to_string());
+
+            let mut dot_file = std::fs::File::create("banks.dot").unwrap();
+            dot_file.write_all(&dot.join("\n").into_bytes()).unwrap();
+            println!("Wrote banks.dot");
+        }
+
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
         let exit = Arc::new(AtomicBool::new(false));
         let bank_info = &bank_forks_info[0];
