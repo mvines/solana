@@ -159,6 +159,44 @@ impl Validator {
             use std::collections::{HashMap, HashSet};
             use std::io::Write;
 
+            // Search all forks and collect the last vote made by each validator
+            let mut last_votes = HashMap::new();
+            for bfi in &bank_forks_info {
+                let bank = bank_forks.banks.get(&bfi.bank_slot).unwrap();
+
+                let total_stake = bank
+                    .vote_accounts()
+                    .iter()
+                    .fold(0, |acc, (_, (stake, _))| acc + stake);
+                for (_, (stake, vote_account)) in bank.vote_accounts() {
+                    let vote_state = VoteState::from(&vote_account).unwrap_or_default();
+                    if let Some(last_vote) = vote_state.votes.iter().last() {
+                        let entry = last_votes.entry(vote_state.node_pubkey).or_insert((
+                            0,
+                            None,
+                            0,
+                            total_stake,
+                        ));
+                        if entry.0 < last_vote.slot {
+                            *entry = (last_vote.slot, vote_state.root_slot, stake, total_stake);
+                        }
+                    }
+                }
+            }
+
+            // Figure the stake distribution at all the nodes containing the last vote from each
+            // validator
+            let mut slot_stake_and_vote_count = HashMap::new();
+            for (_, (last_vote_slot, _, stake, total_stake)) in &last_votes {
+                let entry =
+                    slot_stake_and_vote_count
+                        .entry(last_vote_slot)
+                        .or_insert((0, 0, *total_stake));
+                entry.0 += 1;
+                entry.1 += stake;
+                assert_eq!(entry.2, *total_stake)
+            }
+
             let mut dot = vec!["digraph {".to_string()];
 
             // Build a subgraph consisting of all banks and links to their parent banks
@@ -173,11 +211,23 @@ impl Validator {
                 loop {
                     if !styled_slots.contains(&bank.slot()) {
                         dot.push(format!(
-                            r#"    "{}"[label="{} (epoch {})\nleader: {}",style="{}{}"];"#,
+                            r#"    "{}"[label="{} (epoch {})\nleader: {}{}",style="{}{}"];"#,
                             bank.slot(),
                             bank.slot(),
                             bank.epoch(),
                             bank.collector_id(),
+                            if let Some((votes, stake, total_stake)) =
+                                slot_stake_and_vote_count.get(&bank.slot())
+                            {
+                                format!(
+                                    "\nvotes: {}, stake: {:.1} SOL ({:.1}%)",
+                                    votes,
+                                    lamports_to_sol(*stake),
+                                    *stake as f64 / *total_stake as f64 * 100.,
+                                )
+                            } else {
+                                "".to_string()
+                            },
                             if first { "filled," } else { "" },
                             if !bank.is_votable() { "dotted," } else { "" }
                         ));
@@ -217,26 +267,13 @@ impl Validator {
             }
             dot.push("  }".to_string());
 
-            // Search all forks for the last vote by each validator
-            let mut last_votes = HashMap::new();
-            for bfi in &bank_forks_info {
-                let bank = bank_forks.banks.get(&bfi.bank_slot).unwrap();
-
-                for (_, (stake, vote_account)) in bank.vote_accounts() {
-                    let vote_state = VoteState::from(&vote_account).unwrap_or_default();
-                    if let Some(last_vote) = vote_state.votes.iter().last() {
-                        let entry = last_votes
-                            .entry(vote_state.node_pubkey)
-                            .or_insert((0, None, 0));
-                        if entry.0 < last_vote.slot {
-                            *entry = (last_vote.slot, vote_state.root_slot, stake);
-                        }
-                    }
-                }
-            }
-
-            // Strafe the banks with links from validators to the bank they last voted on
-            for (node_pubkey, (last_vote_slot, root_slot, stake)) in &last_votes {
+            // Strafe the banks with links from validators to the bank they last voted on,
+            // while collecting information about the absent votes and stakes
+            let mut absent_stake = 0;
+            let mut absent_votes = 0;
+            let mut lowest_last_vote_slot = std::u64::MAX;
+            let mut lowest_total_stake = 0;
+            for (node_pubkey, (last_vote_slot, root_slot, stake, total_stake)) in &last_votes {
                 dot.push(format!(
                     r#"  "{}"[shape=box,label="validator: {}\nstake: {} SOL\nlast vote slot: {}\nroot slot: {}"];"#,
                     node_pubkey,
@@ -251,8 +288,24 @@ impl Validator {
                     if styled_slots.contains(&last_vote_slot) {
                         last_vote_slot.to_string()
                     } else {
+                        if *last_vote_slot < lowest_last_vote_slot {
+                            lowest_last_vote_slot = *last_vote_slot;
+                            lowest_total_stake = *total_stake;
+                        }
+                        absent_votes += 1;
+                        absent_stake += stake;
                         "...".to_string()
                     }
+                ));
+            }
+
+            // Annotate the final "..." node with absent vote and stake information
+            if absent_votes > 0 {
+                dot.push(format!(
+                    r#"    "..."[label="...\nvotes: {}, stake: {:.1} SOL {:.1}%"];"#,
+                    absent_votes,
+                    lamports_to_sol(absent_stake),
+                    absent_stake as f64 / lowest_total_stake as f64 * 100.,
                 ));
             }
 
