@@ -26,6 +26,17 @@ enum LedgerOutputMethod {
 }
 
 fn output_slot(blocktree: &Blocktree, slot: u64, method: &LedgerOutputMethod) {
+    println!(
+        "SlotMeta {{ is_root: {}, is_dead: {} }}{}",
+        blocktree.is_root(slot),
+        blocktree.is_dead(slot),
+        if *method == LedgerOutputMethod::Json {
+            ","
+        } else {
+            ""
+        }
+    );
+
     let entries = blocktree
         .get_slot_entries(slot, 0, None)
         .unwrap_or_else(|err| {
