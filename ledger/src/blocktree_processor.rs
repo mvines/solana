@@ -441,6 +441,12 @@ fn process_pending_slots(
         }
 
         bank.freeze(); // all banks handled by this routine are created from complete slots
+        info!(
+            "slot {}: blockhash: {}, bank hash: {}",
+            slot,
+            bank.last_blockhash(),
+            bank.hash()
+        );
 
         if blocktree.is_root(slot) {
             let parents = bank.parents().into_iter().map(|b| b.slot()).rev().skip(1);
