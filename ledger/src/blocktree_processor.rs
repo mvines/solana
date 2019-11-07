@@ -424,13 +424,21 @@ fn process_pending_slots(
             last_status_report = Instant::now();
         }
 
+        if blocktree.is_dead(slot) {
+            warn!("slot {} is dead", slot);
+            continue;
+        }
+
         // Fetch all entries for this slot
         let entries = blocktree.get_slot_entries(slot, 0, None).map_err(|err| {
             warn!("Failed to load entries for slot {}: {:?}", slot, err);
             BlocktreeProcessorError::LedgerVerificationFailed
         })?;
 
-        verify_and_process_entries(&bank, &entries, last_entry_hash, opts)?;
+        if let Err(err) = verify_and_process_entries(&bank, &entries, last_entry_hash, opts) {
+            warn!("slot {} entries failed to process: {:?}", slot, err);
+            continue;
+        }
 
         bank.freeze(); // all banks handled by this routine are created from complete slots
 
