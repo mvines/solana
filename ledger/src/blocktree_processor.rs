@@ -425,8 +425,12 @@ fn process_pending_slots(
         }
 
         if blocktree.is_dead(slot) {
-            warn!("slot {} is dead", slot);
-            continue;
+            warn!(
+                "slot {} is marked dead (leader: {})",
+                slot,
+                bank.collector_id()
+            );
+            //continue;
         }
 
         // Fetch all entries for this slot
@@ -436,16 +440,22 @@ fn process_pending_slots(
         })?;
 
         if let Err(err) = verify_and_process_entries(&bank, &entries, last_entry_hash, opts) {
-            warn!("slot {} entries failed to process: {:?}", slot, err);
+            warn!(
+                "slot {} entries failed to process (parent: {}): {:?}",
+                slot,
+                bank.parent().map(|b| b.slot()).unwrap_or(0),
+                err
+            );
             continue;
         }
 
         bank.freeze(); // all banks handled by this routine are created from complete slots
         info!(
-            "slot {}: blockhash: {}, bank hash: {}",
+            "slot {}: parent: {}, blockhash: {}, leader: {}",
             slot,
+            bank.parent().map(|b| b.slot()).unwrap_or(0),
             bank.last_blockhash(),
-            bank.hash()
+            bank.collector_id()
         );
 
         if blocktree.is_root(slot) {
