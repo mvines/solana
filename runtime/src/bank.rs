@@ -912,6 +912,12 @@ impl Bank {
                     && !hash_queue.check_hash_age(&tx.message().recent_blockhash, max_age)
                 {
                     error_counters.reserve_blockhash += 1;
+                    error!(
+                        "HERE! max_age={} blockhash={} -- check_hash={}",
+                        max_age,
+                        tx.message().recent_blockhash,
+                        hash_queue.check_hash(tx.message().recent_blockhash),
+                    );
                     Err(TransactionError::BlockhashNotFound)
                 } else {
                     lock_res
@@ -1132,7 +1138,10 @@ impl Bank {
             .map(|(tx, res)| {
                 let fee_calculator = hash_queue
                     .get_fee_calculator(&tx.message().recent_blockhash)
-                    .ok_or(TransactionError::BlockhashNotFound)?;
+                    .ok_or_else(|| {
+                        error!("HERE 2!!");
+                        TransactionError::BlockhashNotFound
+                    })?;
                 let fee = fee_calculator.calculate_fee(tx.message());
 
                 let message = tx.message();

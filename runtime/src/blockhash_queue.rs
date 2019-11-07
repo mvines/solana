@@ -1,3 +1,4 @@
+use log::*;
 use serde::{Deserialize, Serialize};
 use solana_sdk::fee_calculator::FeeCalculator;
 use solana_sdk::hash::Hash;
@@ -60,7 +61,7 @@ impl BlockhashQueue {
     }
 
     /// check if hash is valid
-    #[cfg(test)]
+    //    #[cfg(test)]
     pub fn check_hash(&self, hash: Hash) -> bool {
         self.ages.get(&hash).is_some()
     }
@@ -83,6 +84,7 @@ impl BlockhashQueue {
     }
 
     pub fn register_hash(&mut self, hash: &Hash, fee_calculator: &FeeCalculator) {
+        info!("register_hash: {}", hash);
         self.hash_height += 1;
         let hash_height = self.hash_height;
 
