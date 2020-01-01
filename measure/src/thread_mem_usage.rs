@@ -36,4 +36,8 @@ impl Allocatedp {
         #[cfg(not(unix))]
         0
     }
+
+    pub fn since(&self, previous: u64) -> i64 {
+        self.get() as i64 - previous as i64
+    }
 }
