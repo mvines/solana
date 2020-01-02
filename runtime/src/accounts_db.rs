@@ -933,7 +933,7 @@ impl AccountsDB {
                 if let Some((pubkey, account, slot)) = option {
                     if !sysvar::check_id(&account.owner) {
                         let hash = BankHash::from_hash(&Self::hash_account(slot, &account, pubkey));
-                        //debug!("xoring..{} key: {}", hash, pubkey);
+                        debug!("xoring..{} key: {}", hash, pubkey);
                         collector.push(hash);
                     }
                 }

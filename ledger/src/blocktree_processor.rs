@@ -451,9 +451,6 @@ fn process_next_slots(
         // Only process full slots in blocktree_processor, replay_stage
         // handles any partials
         if next_meta.is_full() {
-            //
-            // TODO: measure RAM cost of new_from_parent()
-            //
             let next_bank = Arc::new(Bank::new_from_parent(
                 &bank,
                 &leader_schedule_cache
@@ -518,25 +515,14 @@ fn process_pending_slots(
             BlocktreeProcessorError::FailedToLoadEntries
         })?;
 
-        //
-        // TODO: Measure RAM cost of processing all entries
-        //
-
         if let Err(err) = verify_and_process_slot_entries(&bank, &entries, last_entry_hash, opts) {
             warn!("slot {} failed to verify: {:?}", slot, err);
             continue;
         }
 
         bank.freeze(); // all banks handled by this routine are created from complete slots
-        info!(
-            "slot {}, entries={}, transaction count={}",
-            slot,
-            entries.len(),
-            bank.transaction_count()
-        );
 
         if blocktree.is_root(slot) {
-            warn!("ROOT at {}", slot);
             let parents = bank.parents().into_iter().map(|b| b.slot()).rev().skip(1);
             let parents: Vec<_> = parents.collect();
             rooted_path.extend(parents);
@@ -546,10 +532,6 @@ fn process_pending_slots(
             pending_slots.clear();
             fork_info.clear();
         }
-
-        //
-        // TODO: Measure RAM cost of this entire slot (do this first...)
-        //
 
         if slot >= dev_halt_at_slot {
             let bfi = BankForksInfo { bank_slot: slot };

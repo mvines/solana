@@ -213,7 +213,6 @@ pub fn bank_from_archive<P: AsRef<Path>>(
 ) -> Result<Bank> {
     // Untar the snapshot into a temp directory under `snapshot_config.snapshot_path()`
     let unpack_dir = tempfile::tempdir_in(snapshot_path)?;
-    info!("extracting snapshot into {:?}", unpack_dir);
     untar_snapshot_in(&snapshot_tar, &unpack_dir)?;
 
     let mut measure = Measure::start("bank rebuild from snapshot");
@@ -225,12 +224,9 @@ pub fn bank_from_archive<P: AsRef<Path>>(
         unpacked_accounts_dir,
     )?;
 
-    info!("verify_snapshot_bank - NOP...");
-    /*
     if !bank.verify_snapshot_bank() {
         panic!("Snapshot bank failed to verify");
     }
-    */
     measure.stop();
     info!("{}", measure);
 

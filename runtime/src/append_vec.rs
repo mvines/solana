@@ -82,7 +82,6 @@ pub struct AppendVec {
 
 impl Drop for AppendVec {
     fn drop(&mut self) {
-        println!("Removing {:?}", self.path);
         let _ignored = remove_file(&self.path);
     }
 }
@@ -176,7 +175,6 @@ impl AppendVec {
     #[allow(clippy::mutex_atomic)]
     pub fn set_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         self.path = path.as_ref().to_path_buf();
-        println!("set_file: {:?}", self.path);
         let data = OpenOptions::new()
             .read(true)
             .write(true)
