@@ -147,7 +147,11 @@ impl VoteState {
     }
 
     pub fn deserialize(input: &[u8]) -> Result<Self, InstructionError> {
-        deserialize(input).map_err(|_| InstructionError::InvalidAccountData)
+        //deserialize(input).map_err(|_| InstructionError::InvalidAccountData)
+        deserialize(input).map_err(|err| {
+            println!("deserialize: input={:?}: err={:?}", input, err);
+            InstructionError::InvalidAccountData
+        })
     }
 
     pub fn serialize(&self, output: &mut [u8]) -> Result<(), InstructionError> {
