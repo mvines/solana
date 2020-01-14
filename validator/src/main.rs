@@ -1,5 +1,5 @@
 use bzip2::bufread::BzDecoder;
-use clap::{crate_description, crate_name, value_t, value_t_or_exit, App, Arg};
+use clap::{crate_description, crate_name, value_t, value_t_or_exit, values_t_or_exit, App, Arg};
 use console::{style, Emoji};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::*;
@@ -576,6 +576,14 @@ pub fn main() {
                 .takes_value(false)
                 .help("After processing the ledger, wait until a supermajority of stake is visible on gossip before starting PoH"),
         )
+        .arg(
+            Arg::with_name("hard_forks")
+                .long("hard-fork")
+                .value_name("SLOT")
+                .multiple(true)
+                .takes_value(true)
+                .help("Add a hard fork at this slot"),
+        )
         .get_matches();
 
     let identity_keypair = Arc::new(
@@ -620,6 +628,12 @@ pub fn main() {
     let mut validator_config = ValidatorConfig::default();
     validator_config.dev_sigverify_disabled = matches.is_present("dev_no_sigverify");
     validator_config.dev_halt_at_slot = value_t!(matches, "dev_halt_at_slot", Slot).ok();
+    if matches.is_present("hard_forks") {
+        for slot in values_t_or_exit!(matches, "hard_forks", Slot).into_iter() {
+            let entry = validator_config.new_hard_forks.entry(slot).or_insert(0);
+            *entry += 1;
+        }
+    }
 
     validator_config.rpc_config.enable_validator_exit = matches.is_present("enable_rpc_exit");
     validator_config.wait_for_supermajority = matches.is_present("wait_for_supermajority");

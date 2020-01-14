@@ -20,6 +20,7 @@ use crate::{
     tvu::{Sockets, Tvu},
 };
 use crossbeam_channel::unbounded;
+use solana_ledger::shred::Shred;
 use solana_ledger::{
     bank_forks::{BankForks, SnapshotConfig},
     bank_forks_utils,
@@ -30,17 +31,16 @@ use solana_ledger::{
     leader_schedule_cache::LeaderScheduleCache,
 };
 use solana_metrics::datapoint_info;
+use solana_runtime::bank::{Bank, HardForksMap};
 use solana_sdk::{
     clock::{Slot, DEFAULT_SLOTS_PER_TURN},
     genesis_config::GenesisConfig,
-    hash::Hash,
+    hash::{extend_and_hash, Hash},
     poh_config::PohConfig,
     pubkey::Pubkey,
     signature::{Keypair, KeypairUtil},
     timing::timestamp,
 };
-
-use solana_ledger::shred::Shred;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -69,6 +69,7 @@ pub struct ValidatorConfig {
     pub partition_cfg: Option<PartitionCfg>,
     pub fixed_leader_schedule: Option<FixedSchedule>,
     pub wait_for_supermajority: bool,
+    pub hard_forks: HardForksMap,
 }
 
 impl Default for ValidatorConfig {
@@ -89,6 +90,7 @@ impl Default for ValidatorConfig {
             partition_cfg: None,
             fixed_leader_schedule: None,
             wait_for_supermajority: false,
+            hard_forks: HardForksMap::default(),
         }
     }
 }
@@ -162,11 +164,8 @@ impl Validator {
         ) = new_banks_from_blockstore(
             config.expected_genesis_hash,
             ledger_path,
-            config.account_paths.clone(),
-            config.snapshot_config.clone(),
             poh_verify,
-            config.dev_halt_at_slot,
-            config.fixed_leader_schedule.clone(),
+            config,
         );
 
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
@@ -182,7 +181,7 @@ impl Validator {
         let validator_exit = Arc::new(RwLock::new(Some(validator_exit)));
 
         node.info.wallclock = timestamp();
-        node.info.shred_version = Shred::version_from_hash(&genesis_hash);
+        node.info.shred_version = compute_shred_version(&genesis_hash, &bank.hard_forks());
         Self::print_node_info(&node);
 
         let cluster_info = Arc::new(RwLock::new(ClusterInfo::new(
@@ -469,14 +468,26 @@ impl Validator {
     }
 }
 
-pub fn new_banks_from_blockstore(
+fn compute_shred_version(genesis_hash: &Hash, hard_forks: &HardForksMap) -> u16 {
+    use byteorder::{ByteOrder, LittleEndian};
+
+    let mut hash = *genesis_hash;
+    let mut hard_fork_slots: Vec<_> = hard_forks.keys().collect();
+    hard_fork_slots.sort();
+    for slot in hard_fork_slots.iter() {
+        let mut buf = [0u8; 8];
+        LittleEndian::write_u64(&mut buf[..], *hard_forks.get(slot).unwrap_or(&0));
+        hash = extend_and_hash(&hash, &buf);
+    }
+
+    Shred::version_from_hash(&hash)
+}
+
+fn new_banks_from_blockstore(
     expected_genesis_hash: Option<Hash>,
     blockstore_path: &Path,
-    account_paths: Vec<PathBuf>,
-    snapshot_config: Option<SnapshotConfig>,
     poh_verify: bool,
-    dev_halt_at_slot: Option<Slot>,
-    fixed_leader_schedule: Option<FixedSchedule>,
+    config: &ValidatorConfig,
 ) -> (
     Hash,
     BankForks,
@@ -510,15 +521,16 @@ pub fn new_banks_from_blockstore(
 
     let process_options = blockstore_processor::ProcessOptions {
         poh_verify,
-        dev_halt_at_slot,
+        dev_halt_at_slot: config.dev_halt_at_slot,
+        hard_forks: config.hard_forks.clone(),
         ..blockstore_processor::ProcessOptions::default()
     };
 
     let (mut bank_forks, bank_forks_info, mut leader_schedule_cache) = bank_forks_utils::load(
         &genesis_config,
         &blockstore,
-        account_paths,
-        snapshot_config.as_ref(),
+        config.account_paths.clone(),
+        config.snapshot_config.as_ref(),
         process_options,
     )
     .unwrap_or_else(|err| {
@@ -526,9 +538,9 @@ pub fn new_banks_from_blockstore(
         std::process::exit(1);
     });
 
-    leader_schedule_cache.set_fixed_leader_schedule(fixed_leader_schedule);
+    leader_schedule_cache.set_fixed_leader_schedule(config.fixed_leader_schedule.clone());
 
-    bank_forks.set_snapshot_config(snapshot_config);
+    bank_forks.set_snapshot_config(config.snapshot_config.clone());
 
     (
         genesis_hash,
@@ -607,10 +619,7 @@ fn report_target_features() {
 }
 
 // Get the activated stake percentage (based on the provided bank) that is visible in gossip
-fn get_stake_percent_in_gossip(
-    bank: &Arc<solana_runtime::bank::Bank>,
-    cluster_info: &Arc<RwLock<ClusterInfo>>,
-) -> u64 {
+fn get_stake_percent_in_gossip(bank: &Arc<Bank>, cluster_info: &Arc<RwLock<ClusterInfo>>) -> u64 {
     let mut gossip_stake = 0;
     let mut total_activated_stake = 0;
     let tvu_peers = cluster_info.read().unwrap().tvu_peers();

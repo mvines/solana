@@ -16,7 +16,9 @@ use solana_measure::{measure::Measure, thread_mem_usage};
 use solana_metrics::{datapoint, datapoint_error, inc_new_counter_debug};
 use solana_rayon_threadlimit::get_thread_count;
 use solana_runtime::{
-    bank::{Bank, TransactionBalancesSet, TransactionProcessResult, TransactionResults},
+    bank::{
+        Bank, HardForksMap, TransactionBalancesSet, TransactionProcessResult, TransactionResults,
+    },
     transaction_batch::TransactionBatch,
 };
 use solana_sdk::{
@@ -252,6 +254,9 @@ pub enum BlockstoreProcessorError {
 
     #[error("no valid forks found")]
     NoValidForksFound,
+
+    #[error("invalid hard fork")]
+    InvalidHardFork(Slot),
 }
 
 /// Callback for accessing bank state while processing the blockstore
@@ -264,6 +269,7 @@ pub struct ProcessOptions {
     pub dev_halt_at_slot: Option<Slot>,
     pub entry_callback: Option<ProcessCallback>,
     pub override_num_threads: Option<usize>,
+    pub new_hard_forks: HardForksMap,
 }
 
 pub fn process_blockstore(
@@ -312,6 +318,31 @@ pub fn process_blockstore_from_root(
     bank.set_entered_epoch_callback(solana_genesis_programs::get_entered_epoch_callback(
         genesis_config.operating_mode,
     ));
+
+    {
+        let mut hard_forks = bank.hard_forks();
+        if hard_forks != opts.new_hard_forks {
+            // Ensure the user isn't trying to add new hard forks for a slot that's earlier than the current
+            // root slot.  Doing so won't cause any effect so emit an error
+            for (hard_fork_slot, hard_fork_count) in opts.new_hard_forks.iter() {
+                if *hard_fork_slot <= start_slot {
+                    if Some(hard_fork_count) != hard_forks.get(hard_fork_slot) {
+                        error!("New hard forks must be greater than slot {}", start_slot);
+                        return Err(BlockstoreProcessorError::InvalidHardFork(*hard_fork_slot));
+                    }
+                } else {
+                    warn!(
+                        "Increasing slot {} hard fork count by {}",
+                        hard_fork_slot, hard_fork_count
+                    );
+                    *hard_forks.entry(*hard_fork_slot).or_insert(0) += hard_fork_count;
+                }
+            }
+
+            warn!("Bank hard forks have changed: {:?}", hard_forks);
+            bank.set_hard_forks(hard_forks);
+        }
+    }
 
     blockstore
         .set_roots(&[start_slot])

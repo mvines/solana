@@ -35,7 +35,7 @@ use solana_sdk::{
     epoch_schedule::EpochSchedule,
     fee_calculator::FeeCalculator,
     genesis_config::GenesisConfig,
-    hash::{hashv, Hash},
+    hash::{extend_and_hash, hashv, Hash},
     inflation::Inflation,
     native_loader,
     nonce_state::NonceState,
@@ -166,6 +166,10 @@ impl StatusCacheRc {
 
 pub type EnteredEpochCallback = Box<dyn Fn(&mut Bank) -> () + Sync + Send>;
 
+// Whenever the bank for a given slot in `HardForksMap` is frozen, include the corresponding value
+// in the bank hash
+pub type HardForksMap = HashMap<Slot, u64>;
+
 pub type TransactionProcessResult = (Result<()>, Option<HashAgeKind>);
 pub struct TransactionResults {
     pub fee_collection_results: Vec<Result<()>>,
@@ -225,6 +229,9 @@ pub struct Bank {
 
     /// parent's slot
     parent_slot: Slot,
+
+    /// slots to hard fork at
+    hard_forks: Arc<RwLock<HardForksMap>>,
 
     /// The number of transactions processed without error
     #[serde(serialize_with = "serialize_atomicu64")]
@@ -422,6 +429,7 @@ impl Bank {
             signature_count: AtomicU64::new(0),
             message_processor: MessageProcessor::default(),
             entered_epoch_callback: parent.entered_epoch_callback.clone(),
+            hard_forks: parent.hard_forks.clone(),
             last_vote_sync: AtomicU64::new(parent.last_vote_sync.load(Ordering::Relaxed)),
         };
 
@@ -1698,6 +1706,14 @@ impl Bank {
         *self.inflation.write().unwrap() = inflation;
     }
 
+    pub fn hard_forks(&self) -> HardForksMap {
+        self.hard_forks.read().unwrap().clone()
+    }
+
+    pub fn set_hard_forks(&self, hard_forks: HardForksMap) {
+        *self.hard_forks.write().unwrap() = hard_forks;
+    }
+
     pub fn set_entered_epoch_callback(&self, entered_epoch_callback: EnteredEpochCallback) {
         *self.entered_epoch_callback.write().unwrap() = Some(entered_epoch_callback);
     }
@@ -1776,20 +1792,39 @@ impl Bank {
         let accounts_delta_hash = self.rc.accounts.bank_hash_info_at(self.slot());
         let mut signature_count_buf = [0u8; 8];
         LittleEndian::write_u64(&mut signature_count_buf[..], self.signature_count() as u64);
-        let hash = hashv(&[
+
+        let mut hash = hashv(&[
             self.parent_hash.as_ref(),
             accounts_delta_hash.hash.as_ref(),
             &signature_count_buf,
             self.last_blockhash().as_ref(),
         ]);
+
+        let hard_forks = *self
+            .hard_forks
+            .read()
+            .unwrap()
+            .get(&self.slot())
+            .unwrap_or(&0);
+
+        if hard_forks > 0 {
+            let mut buf = [0u8; 8];
+            LittleEndian::write_u64(&mut buf[..], hard_forks);
+            hash = extend_and_hash(&hash, &buf)
+        }
+
         info!(
             "bank frozen: {} hash: {} accounts_delta: {} signature_count: {} last_blockhash: {}",
             self.slot(),
             hash,
             accounts_delta_hash.hash,
             self.signature_count(),
-            self.last_blockhash()
+            self.last_blockhash(),
         );
+        if hard_forks > 0 {
+            info!("bank {} hard forks: {} ", self.slot(), hard_forks)
+        }
+
         info!(
             "accounts hash slot: {} stats: {:?}",
             self.slot(),
@@ -2144,6 +2179,7 @@ impl From<LegacyBank0223> for Bank {
             storage_accounts: bank.storage_accounts,
             parent_hash: bank.parent_hash,
             parent_slot: bank.parent_slot,
+            hard_forks: Arc::new(RwLock::new(HardForksMap::new())),
             collector_id: bank.collector_id,
             collector_fees: bank.collector_fees,
             ancestors: bank.ancestors,

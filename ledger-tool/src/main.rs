@@ -606,6 +606,14 @@ fn main() {
                     .help("Skip ledger PoH verification"),
             )
             .arg(
+                Arg::with_name("hard_forks")
+                    .long("hard-fork")
+                    .value_name("SLOT")
+                    .multiple(true)
+                    .takes_value(true)
+                    .help("Add a hard fork at this slot"),
+            )
+            .arg(
                 Arg::with_name("graph_forks")
                     .long("graph-forks")
                     .value_name("FILENAME")
@@ -719,11 +727,18 @@ fn main() {
                 vec![ledger_path.join("accounts")]
             };
 
-            let process_options = blockstore_processor::ProcessOptions {
+            let mut process_options = blockstore_processor::ProcessOptions {
                 poh_verify,
                 dev_halt_at_slot,
                 ..blockstore_processor::ProcessOptions::default()
             };
+
+            if arg_matches.is_present("hard_forks") {
+                for slot in values_t_or_exit!(arg_matches, "hard_forks", Slot).into_iter() {
+                    let entry = process_options.new_hard_forks.entry(slot).or_insert(0);
+                    *entry += 1;
+                }
+            }
 
             match bank_forks_utils::load(
                 &open_genesis_config(&ledger_path),
