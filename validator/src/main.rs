@@ -438,8 +438,7 @@ fn download_snapshot(
 ) -> Result<bool, String> {
     let snapshot_package = solana_ledger::snapshot_utils::get_snapshot_archive_path(ledger_path);
     if snapshot_package.exists() {
-        fs::remove_file(&snapshot_package)
-            .map_err(|err| format!("error removing {:?}: {}", snapshot_package, err))?;
+        return Ok(true);
     }
 
     let snapshot_tar_bz2 = snapshot_package.file_name().unwrap().to_str().unwrap();
