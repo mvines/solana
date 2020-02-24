@@ -23,7 +23,7 @@ use solana_core::{
     rpc::JsonRpcConfig,
     validator::{Validator, ValidatorConfig},
 };
-use solana_ledger::bank_forks::SnapshotConfig;
+use solana_ledger::{bank_forks::SnapshotConfig, snapshot_utils::bank_slot_from_archive};
 use solana_perf::recycler::enable_recycler_warming;
 use solana_sdk::{
     clock::Slot,
@@ -254,6 +254,7 @@ fn get_rpc_node(
     entrypoint_gossip: &SocketAddr,
     expected_shred_version: Option<u16>,
     trusted_validators: Option<&HashSet<Pubkey>>,
+    blacklisted_rpc_nodes: &HashSet<Pubkey>,
     snapshot_not_required: bool,
 ) -> (ContactInfo, RpcClient, Option<(Slot, Hash)>) {
     let mut cluster_info = ClusterInfo::new(
@@ -295,6 +296,10 @@ fn get_rpc_node(
             let mut eligible_rpc_peers = vec![];
 
             for rpc_peer in rpc_peers.iter() {
+                if blacklisted_rpc_nodes.contains(&rpc_peer.id) {
+                    continue; // Nope
+                }
+
                 if let Some(snapshot_hashes) = cluster_info
                     .read()
                     .unwrap()
@@ -426,30 +431,45 @@ fn check_vote_account(
     Ok(())
 }
 
-fn download_ledger(
+fn download_snapshot(
     rpc_addr: &SocketAddr,
     ledger_path: &Path,
-    snapshot_hash: Option<(Slot, Hash)>,
-) -> Result<(), String> {
-    download_tar_bz2(rpc_addr, "genesis.tar.bz2", ledger_path, false)?;
-
-    if snapshot_hash.is_some() {
-        let snapshot_package =
-            solana_ledger::snapshot_utils::get_snapshot_archive_path(ledger_path);
-        if snapshot_package.exists() {
-            fs::remove_file(&snapshot_package)
-                .map_err(|err| format!("error removing {:?}: {}", snapshot_package, err))?;
-        }
-        download_tar_bz2(
-            rpc_addr,
-            snapshot_package.file_name().unwrap().to_str().unwrap(),
-            snapshot_package.parent().unwrap(),
-            true,
-        )
-        .map_err(|err| format!("Failed to fetch snapshot: {:?}", err))?;
+    snapshot_hash: (Slot, Hash),
+) -> Result<bool, String> {
+    let snapshot_package = solana_ledger::snapshot_utils::get_snapshot_archive_path(ledger_path);
+    if snapshot_package.exists() {
+        fs::remove_file(&snapshot_package)
+            .map_err(|err| format!("error removing {:?}: {}", snapshot_package, err))?;
     }
 
-    Ok(())
+    let snapshot_tar_bz2 = snapshot_package.file_name().unwrap().to_str().unwrap();
+    download_tar_bz2(
+        rpc_addr,
+        snapshot_tar_bz2,
+        snapshot_package.parent().unwrap(),
+        true,
+    )
+    .map_err(|err| format!("Failed to fetch snapshot: {:?}", err))?;
+
+    // Ensure the downloaded snapshot slot is what was expected.
+    info!(
+        "Validating download snapshot slot is {} (this may take minutes...)",
+        snapshot_hash.0
+    );
+    let snapshot_slot = bank_slot_from_archive(snapshot_tar_bz2).map_err(|err| {
+        format!(
+            "error extracting snapshot archive: {:?}: {}",
+            snapshot_tar_bz2, err
+        )
+    })?;
+
+    if snapshot_slot != snapshot_hash.0 {
+        // TODO: verify the snapshot hash as well
+        error!("Unexpected snapshot slot: {}", snapshot_slot);
+        Ok(false)
+    } else {
+        Ok(true)
+    }
 }
 
 // This function is duplicated in ledger-tool/src/main.rs...
@@ -1020,55 +1040,82 @@ pub fn main() {
         */
 
         if !no_genesis_fetch {
-            let (rpc_contact_info, rpc_client, snapshot_hash) = get_rpc_node(
-                &node,
-                &identity_keypair,
-                &cluster_entrypoint.gossip,
-                validator_config.expected_shred_version,
-                validator_config
-                    .snapshot_config
-                    .as_ref()
-                    .unwrap()
-                    .trusted_validators
-                    .as_ref(),
-                no_snapshot_fetch,
-            );
+            let mut blacklisted_rpc_nodes = HashSet::new();
+            loop {
+                let (rpc_contact_info, rpc_client, snapshot_hash) = get_rpc_node(
+                    &node,
+                    &identity_keypair,
+                    &cluster_entrypoint.gossip,
+                    validator_config.expected_shred_version,
+                    validator_config
+                        .snapshot_config
+                        .as_ref()
+                        .unwrap()
+                        .trusted_validators
+                        .as_ref(),
+                    &blacklisted_rpc_nodes,
+                    no_snapshot_fetch,
+                );
 
-            let genesis_hash = rpc_client.get_genesis_hash().unwrap_or_else(|err| {
-                error!("Failed to get genesis hash: {}", err);
-                exit(1);
-            });
-
-            if let Some(expected_genesis_hash) = validator_config.expected_genesis_hash {
-                if expected_genesis_hash != genesis_hash {
-                    error!(
-                        "Genesis hash mismatch: expected {} but local genesis hash is {}",
-                        expected_genesis_hash, genesis_hash,
-                    );
-                    exit(1);
-                }
-            }
-            validator_config.expected_genesis_hash = Some(genesis_hash);
-
-            if !validator_config.voting_disabled {
-                check_vote_account(
-                    &rpc_client,
-                    &vote_account,
-                    &voting_keypair.pubkey(),
-                    &identity_keypair.pubkey(),
-                )
-                .unwrap_or_else(|err| {
-                    error!("Failed to check vote account: {}", err);
+                let genesis_hash = rpc_client.get_genesis_hash().unwrap_or_else(|err| {
+                    error!("Failed to get genesis hash: {}", err);
                     exit(1);
                 });
-            }
 
-            download_ledger(&rpc_contact_info.rpc, &ledger_path, snapshot_hash).unwrap_or_else(
-                |err| {
-                    error!("Failed to initialize ledger: {}", err);
+                if let Some(expected_genesis_hash) = validator_config.expected_genesis_hash {
+                    if expected_genesis_hash != genesis_hash {
+                        error!(
+                            "Genesis hash mismatch: expected {} but local genesis hash is {}",
+                            expected_genesis_hash, genesis_hash,
+                        );
+                        exit(1);
+                    }
+                }
+                validator_config.expected_genesis_hash = Some(genesis_hash);
+
+                if !validator_config.voting_disabled {
+                    check_vote_account(
+                        &rpc_client,
+                        &vote_account,
+                        &voting_keypair.pubkey(),
+                        &identity_keypair.pubkey(),
+                    )
+                    .unwrap_or_else(|err| {
+                        error!("Failed to check vote account: {}", err);
+                        exit(1);
+                    });
+                }
+
+                download_tar_bz2(
+                    &rpc_contact_info.rpc,
+                    "genesis.tar.bz2",
+                    &ledger_path,
+                    false,
+                )
+                .unwrap_or_else(|err| {
+                    error!("Failed to download genesis config: {}", err);
                     exit(1);
-                },
-            );
+                });
+
+                if let Some(snapshot_hash) = snapshot_hash {
+                    let ok = download_snapshot(&rpc_contact_info.rpc, &ledger_path, snapshot_hash)
+                        .unwrap_or_else(|err| {
+                            error!("Failed to download snapshot: {}", err);
+                            exit(1);
+                        });
+                    if ok {
+                        break;
+                    }
+
+                    info!(
+                        "Excluding {} as a future RPC candidate",
+                        rpc_contact_info.id
+                    );
+                    blacklisted_rpc_nodes.insert(rpc_contact_info.id);
+                } else {
+                    break;
+                }
+            }
         }
     }
 
