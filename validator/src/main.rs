@@ -23,7 +23,7 @@ use solana_core::{
     rpc::JsonRpcConfig,
     validator::{Validator, ValidatorConfig},
 };
-use solana_ledger::{bank_forks::SnapshotConfig, snapshot_utils::bank_slot_from_archive};
+use solana_ledger::bank_forks::SnapshotConfig;
 use solana_perf::recycler::enable_recycler_warming;
 use solana_sdk::{
     clock::Slot,
@@ -450,6 +450,7 @@ fn download_snapshot(
     )
     .map_err(|err| format!("Failed to fetch snapshot: {:?}", err))?;
 
+    /*
     // Ensure the downloaded snapshot slot is what was expected.
     info!(
         "Validating download snapshot slot is {} (this may take minutes...)",
@@ -469,6 +470,8 @@ fn download_snapshot(
     } else {
         Ok(true)
     }
+    */
+    Ok(true)
 }
 
 // This function is duplicated in ledger-tool/src/main.rs...
