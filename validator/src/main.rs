@@ -991,11 +991,13 @@ pub fn main() {
             tcp_listeners.push((node.info.gossip.port(), ip_echo));
         }
 
+        /*
         solana_net_utils::verify_reachable_ports(
             &cluster_entrypoint.gossip,
             tcp_listeners,
             &udp_sockets,
         );
+        */
 
         if !no_genesis_fetch {
             let (rpc_client, rpc_addr) = get_rpc_addr(
