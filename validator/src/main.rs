@@ -436,7 +436,8 @@ fn download_snapshot(
     ledger_path: &Path,
     snapshot_hash: (Slot, Hash),
 ) -> Result<bool, String> {
-    let snapshot_package = solana_ledger::snapshot_utils::get_snapshot_archive_path(ledger_path);
+    let snapshot_package =
+        solana_ledger::snapshot_utils::get_snapshot_archive_path(ledger_path, &snapshot_hash);
     if snapshot_package.exists() {
         return Ok(true);
     }
