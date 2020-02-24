@@ -340,6 +340,21 @@ impl Validator {
         }
 
         if let Some(snapshot_hash) = snapshot_hash {
+            if let Some(ref expected_snapshot_hash) = config
+                .snapshot_config
+                .as_ref()
+                .unwrap()
+                .expected_snapshot_hash
+            {
+                if *expected_snapshot_hash != snapshot_hash {
+                    error!(
+                        "Snapshot hash mismatch.\nExpected: {:?}\nActual: {:?}",
+                        expected_snapshot_hash, snapshot_hash
+                    );
+                    process::exit(1);
+                }
+            }
+
             if let Some(ref trusted_validators) =
                 config.snapshot_config.as_ref().unwrap().trusted_validators
             {

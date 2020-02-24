@@ -883,6 +883,7 @@ pub fn main() {
         snapshot_path,
         snapshot_package_output_path: ledger_path.clone(),
         trusted_validators,
+        expected_snapshot_hash: None,
     });
 
     if matches.is_present("limit_ledger_size") {
@@ -1106,6 +1107,11 @@ pub fn main() {
                             exit(1);
                         });
                     if ok {
+                        validator_config
+                            .snapshot_config
+                            .as_mut()
+                            .unwrap()
+                            .expected_snapshot_hash = Some(snapshot_hash);
                         break;
                     }
 

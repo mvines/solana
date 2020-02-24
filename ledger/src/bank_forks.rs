@@ -6,7 +6,7 @@ use log::*;
 use solana_measure::measure::Measure;
 use solana_metrics::inc_new_counter_info;
 use solana_runtime::{bank::Bank, status_cache::MAX_CACHE_ENTRIES};
-use solana_sdk::{clock::Slot, pubkey::Pubkey, timing};
+use solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey, timing};
 use std::{
     collections::{HashMap, HashSet},
     ops::Index,
@@ -30,6 +30,9 @@ pub struct SnapshotConfig {
     // Validators that must vouch for a given snapshot hash before it's accepted
     // None = accept any snapshot hash
     pub trusted_validators: Option<HashSet<Pubkey>>,
+
+    // The snapshot hash that the validator is expected to load
+    pub expected_snapshot_hash: Option<(Slot, Hash)>,
 }
 
 #[derive(Error, Debug)]
