@@ -503,13 +503,8 @@ fn is_snapshot_compression_disabled() -> bool {
     }
 }
 
-pub fn get_snapshot_archive_path<P: AsRef<Path>>(
-    snapshot_output_dir: P,
-    snapshot_hash: &(Slot, Hash),
-) -> PathBuf {
-    snapshot_output_dir
-        .as_ref()
-        .join(format!("snapshot-{}-{}.tar.bz2", snapshot.0, snapshot.1))
+pub fn get_snapshot_archive_path<P: AsRef<Path>>(snapshot_output_dir: P) -> PathBuf {
+    snapshot_output_dir.as_ref().join("snapshot.tar.bz2")
 }
 
 pub fn untar_snapshot_in<P: AsRef<Path>, Q: AsRef<Path>>(
