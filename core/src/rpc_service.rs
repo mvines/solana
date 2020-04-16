@@ -287,7 +287,7 @@ impl JsonRpcService {
                         genesis_hash,
                     },
                 )
-                .threads(4)
+                .threads(32)
                 .cors(DomainsValidation::AllowOnly(vec![
                     AccessControlAllowOrigin::Any,
                 ]))
