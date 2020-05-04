@@ -212,6 +212,7 @@ impl CrdsGossipPush {
             }
             self.push_messages.remove(&v.label());
         }
+
         push_messages
     }
 
@@ -236,13 +237,14 @@ impl CrdsGossipPush {
         crds: &Crds,
         stakes: &HashMap<Pubkey, u64>,
         self_id: &Pubkey,
+        self_shred_version: u16,
         network_size: usize,
         ratio: usize,
     ) {
         let need = Self::compute_need(self.num_active, self.active_set.len(), ratio);
         let mut new_items = HashMap::new();
 
-        let options: Vec<_> = self.push_options(crds, &self_id, stakes);
+        let options: Vec<_> = self.push_options(crds, &self_id, self_shred_version, stakes);
         if options.is_empty() {
             return;
         }
@@ -288,13 +290,18 @@ impl CrdsGossipPush {
         &self,
         crds: &'a Crds,
         self_id: &Pubkey,
+        self_shred_version: u16,
         stakes: &HashMap<Pubkey, u64>,
     ) -> Vec<(f32, &'a ContactInfo)> {
         crds.table
             .values()
             .filter(|v| v.value.contact_info().is_some())
             .map(|v| (v.value.contact_info().unwrap(), v))
-            .filter(|(info, _)| info.id != *self_id && ContactInfo::is_valid_address(&info.gossip))
+            .filter(|(info, _)| {
+                info.id != *self_id
+                    && ContactInfo::is_valid_address(&info.gossip)
+                    && (self_shred_version == 0 || info.shred_version == 0 || self_shred_version == info.shred_version)
+            })
             .map(|(info, value)| {
                 let max_weight = f32::from(u16::max_value()) - 1.0;
                 let last_updated: u64 = value.local_timestamp;

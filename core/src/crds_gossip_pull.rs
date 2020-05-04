@@ -144,11 +144,12 @@ impl CrdsGossipPull {
         &self,
         crds: &Crds,
         self_id: &Pubkey,
+        self_shred_version: u16,
         now: u64,
         stakes: &HashMap<Pubkey, u64>,
         bloom_size: usize,
     ) -> Result<(Pubkey, Vec<CrdsFilter>, CrdsValue), CrdsGossipError> {
-        let options = self.pull_options(crds, &self_id, now, stakes);
+        let options = self.pull_options(crds, &self_id, self_shred_version, now, stakes);
         if options.is_empty() {
             return Err(CrdsGossipError::NoPeers);
         }
@@ -165,13 +166,18 @@ impl CrdsGossipPull {
         &self,
         crds: &'a Crds,
         self_id: &Pubkey,
+        self_shred_version: u16,
         now: u64,
         stakes: &HashMap<Pubkey, u64>,
     ) -> Vec<(f32, &'a ContactInfo)> {
         crds.table
             .values()
             .filter_map(|v| v.value.contact_info())
-            .filter(|v| v.id != *self_id && ContactInfo::is_valid_address(&v.gossip))
+            .filter(|v| {
+                v.id != *self_id
+                    && ContactInfo::is_valid_address(&v.gossip)
+                    && (self_shred_version == 0 || v.shred_version == 0 || self_shred_version == v.shred_version)
+            })
             .map(|item| {
                 let max_weight = f32::from(u16::max_value()) - 1.0;
                 let req_time: u64 = *self.pull_request_time.get(&item.id).unwrap_or(&0);
