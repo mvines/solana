@@ -348,6 +348,28 @@ impl Blockstore {
         self.purge_slots_with_delay(from_slot, to_slot, None)
     }
 
+    /// Ensures that the SlotMeta::next_slots vector for all slots contain no references in the
+    /// [from_slot,to_slot] range
+    ///
+    /// Dangerous; Use with care
+    pub fn purge_from_next_slots(&self, from_slot: Slot, to_slot: Slot) {
+        for (slot, mut meta) in self
+            .slot_meta_iterator(0)
+            .expect("unable to iterate over meta")
+        {
+            if slot > to_slot {
+                break;
+            }
+            meta.next_slots
+                .retain(|slot| *slot < from_slot || *slot > to_slot);
+            self.put_meta_bytes(
+                slot,
+                &bincode::serialize(&meta).expect("couldn't update meta"),
+            )
+            .expect("couldn't update meta");
+        }
+    }
+
     // Returns whether or not all columns successfully purged the slot range
     fn run_purge(&self, from_slot: Slot, to_slot: Slot) -> Result<bool> {
         let mut write_batch = self
