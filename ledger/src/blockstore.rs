@@ -360,13 +360,21 @@ impl Blockstore {
             if slot > to_slot {
                 break;
             }
+
+            let original = meta.next_slots;
+            let original_len = meta.next_slots.len();
             meta.next_slots
                 .retain(|slot| *slot < from_slot || *slot > to_slot);
-            self.put_meta_bytes(
-                slot,
-                &bincode::serialize(&meta).expect("couldn't update meta"),
-            )
-            .expect("couldn't update meta");
+            if meta.next_slots.len() != original_len {
+                info!("purge_from_next_slots: {} from {} to {}", slot, original_len. meta.next_slots);
+                /*
+                self.put_meta_bytes(
+                    slot,
+                    &bincode::serialize(&meta).expect("couldn't update meta"),
+                )
+                .expect("couldn't update meta");
+                */
+            }
         }
     }
 
