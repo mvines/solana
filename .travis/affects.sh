@@ -14,4 +14,5 @@ for file in $(git diff --name-only $TRAVIS_COMMIT_RANGE); do
   fi
 done
 
+echo "No modifications to $1"
 exit 1
