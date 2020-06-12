@@ -15,8 +15,8 @@ jobs:
   include:
     - &release-artifacts
       if: type = push
-      name: "Linux release artifacts"
-      os: linux
+      name: "macOS release artifacts"
+      os: osx
       language: rust
       rust:
         - stable
@@ -44,11 +44,13 @@ jobs:
           on:
             tags: true
     - <<: *release-artifacts
+      name: "Linux release artifacts"
+      os: linux
+      before_install:
+        - sudo apt-get install libssl-dev libudev-dev
+    - <<: *release-artifacts
       name: "Windows release artifacts"
       os: windows
-    - <<: *release-artifacts
-      name: "macOS release artifacts"
-      os: osx
 
     - name: "web3.js"
       language: node_js
@@ -64,7 +66,7 @@ jobs:
 
       branches:
         only:
-          - master
+          - mmmmmmmmmmmaster
 
       notifications:
         email: false
