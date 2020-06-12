@@ -3,7 +3,13 @@ branches:
     - master
     - /^v\d+\.\d+/
 
+notifications:
+  slack:
+    on_success: change
+    secure: F4IjOE05MyaMOdPRL+r8qhs7jBvv4yDM3RmFKE1zNXnfUOqV4X38oQM1EI+YVsgpMQLj/pxnEB7wcTE4Bf86N6moLssEULCpvAuMVoXj4QbWdomLX+01WbFa6fLVeNQIg45NHrz2XzVBhoKOrMNnl+QI5mbR2AlS5oqsudHsXDnyLzZtd4Y5SDMdYG1zVWM01+oNNjgNfjcCGmOE/K0CnOMl6GPi3X9C34tJ19P2XT7MTDsz1/IfEF7fro2Q8DHEYL9dchJMoisXSkem5z7IDQkGzXsWdWT4NnndUvmd1MlTCE9qgoXDqRf95Qh8sB1Dz08HtvgfaosP2XjtNTfDI9BBYS15Ibw9y7PchAJE1luteNjF35EOy6OgmCLw/YpnweqfuNViBZz+yOPWXVC0kxnPIXKZ1wyH9ibeH6E4hr7a8o9SV/6SiWIlbYF+IR9jPXyTCLP/cc3sYljPWxDnhWFwFdRVIi3PbVAhVu7uWtVUO17Oc9gtGPgs/GrhOMkJfwQPXaudRJDpVZowxTX4x9kefNotlMAMRgq+Drbmgt4eEBiCNp0ITWgh17BiE1U09WS3myuduhoct85+FoVeaUkp1sxzHVtGsNQH0hcz7WcpZyOM+AwistJA/qzeEDQao5zi1eKWPbO2xAhi2rV1bDH6bPf/4lDBwLRqSiwvlWU=
+
 dist: bionic
+sudo: required
 
 jobs:
   include:
@@ -44,9 +50,85 @@ jobs:
       name: "macOS release artifacts"
       os: osx
 
-notifications:
-  slack:
-    on_success: change
-    secure: F4IjOE05MyaMOdPRL+r8qhs7jBvv4yDM3RmFKE1zNXnfUOqV4X38oQM1EI+YVsgpMQLj/pxnEB7wcTE4Bf86N6moLssEULCpvAuMVoXj4QbWdomLX+01WbFa6fLVeNQIg45NHrz2XzVBhoKOrMNnl+QI5mbR2AlS5oqsudHsXDnyLzZtd4Y5SDMdYG1zVWM01+oNNjgNfjcCGmOE/K0CnOMl6GPi3X9C34tJ19P2XT7MTDsz1/IfEF7fro2Q8DHEYL9dchJMoisXSkem5z7IDQkGzXsWdWT4NnndUvmd1MlTCE9qgoXDqRf95Qh8sB1Dz08HtvgfaosP2XjtNTfDI9BBYS15Ibw9y7PchAJE1luteNjF35EOy6OgmCLw/YpnweqfuNViBZz+yOPWXVC0kxnPIXKZ1wyH9ibeH6E4hr7a8o9SV/6SiWIlbYF+IR9jPXyTCLP/cc3sYljPWxDnhWFwFdRVIi3PbVAhVu7uWtVUO17Oc9gtGPgs/GrhOMkJfwQPXaudRJDpVZowxTX4x9kefNotlMAMRgq+Drbmgt4eEBiCNp0ITWgh17BiE1U09WS3myuduhoct85+FoVeaUkp1sxzHVtGsNQH0hcz7WcpZyOM+AwistJA/qzeEDQao5zi1eKWPbO2xAhi2rV1bDH6bPf/4lDBwLRqSiwvlWU=
+    - name: "web3.js"
+      language: node_js
+      node_js:
+        - "lts/*"
 
+      services:
+        - docker
 
+      cache:
+        directories:
+          - ~/.npm
+
+      branches:
+        only:
+          - master
+
+      notifications:
+        email: false
+
+      before_install:
+        - wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        - sudo apt-add-repository "deb http://apt.llvm.org/bionic/ llvm-toolchain-bionic-10 main"
+        - sudo apt-get update
+        - sudo apt-get install -y clang-7 --allow-unauthenticated
+        - sudo apt-get install -y openssl --allow-unauthenticated
+        - sudo apt-get install -y libssl-dev --allow-unauthenticated
+        - sudo apt-get install -y libssl1.1 --allow-unauthenticated
+        - clang-7 --version
+        - curl https://sh.rustup.rs -sSf | sh -s -- -y
+        - PATH=$HOME/.cargo/bin:$PATH
+        - rustup --version
+
+      script:
+        - if [[ $TRAVIS_PULL_REQUEST != false ]]; then npx commitlint-travis; fi
+        - ls -l lib
+        - test -r lib/index.iife.js
+        - test -r lib/index.cjs.js
+        - test -r lib/index.esm.js
+        - npm run doc
+        - npm run defs
+        - npm run flow
+        - npm run lint
+        - npm run codecov
+        - make -C examples/bpf-c-noop/
+        - examples/bpf-rust-noop/do.sh build
+        - npm run localnet:update
+        - npm run localnet:up
+        - npm run test:live
+        - npm run localnet:down
+
+      before_deploy:
+        - rm -rf deploy
+        - mkdir -p deploy
+        - cp -r doc deploy/solanaWeb3Api-$TRAVIS_BRANCH
+        - ls -l lib
+        - cp lib/index.iife.js deploy/solanaWeb3.min.js
+        - ( cd deploy; tar zcf solanaWeb3Api.tgz solanaWeb3Api-$TRAVIS_BRANCH )
+
+      deploy:
+        - provider: pages
+          skip-cleanup: true
+          github-token: $GITHUB_TOKEN
+          local-dir: doc
+          on:
+            branch: master
+            node_js: "lts/*"
+        - provider: script
+          skip_cleanup: true
+          script:
+            - npx semantic-release
+          on:
+            branch: master
+            node_js: "lts/*"
+        - provider: releases
+          skip-cleanup: true
+          file:
+            - deploy/solanaWeb3.min.js
+            - deploy/solanaWeb3Api.tgz
+          api_key: $GITHUB_TOKEN
+          on:
+            tags: true
+            node_js: "lts/*"
