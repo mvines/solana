@@ -37,7 +37,7 @@ jobs:
           on:
             all_branches: true
         - provider: releases
-          api_key: $GITHUB_TOKEN
+          token: $GITHUB_TOKEN
           skip_cleanup: true
           file_glob: true
           file: travis-release-upload/*
@@ -66,7 +66,7 @@ jobs:
           - ~/.npm
 
       before_install:
-        - travis_terminate 0
+        - ./tcheck.sh || travis_terminate 0
         - wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
         - sudo apt-add-repository "deb http://apt.llvm.org/bionic/ llvm-toolchain-bionic-10 main"
         - sudo apt-get update
@@ -107,7 +107,7 @@ jobs:
 
       deploy:
         - provider: pages
-          skip-cleanup: true
+          skip_cleanup: true
           token: $GITHUB_TOKEN
           local_dir: doc
           on:
@@ -121,7 +121,7 @@ jobs:
             branch: master
             node_js: "lts/*"
         - provider: releases
-          skip-cleanup: true
+          skip_cleanup: true
           file:
             - deploy/solanaWeb3.min.js
             - deploy/solanaWeb3Api.tgz
