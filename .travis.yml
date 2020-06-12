@@ -7,9 +7,9 @@ dist: bionic
 
 jobs:
   include:
-    # Linux release artifacts
     - &release-artifacts
       if: type = push
+      name: "Linux release artifacts"
       os: linux
       language: rust
       rust:
@@ -37,11 +37,11 @@ jobs:
           file: travis-release-upload/*
           on:
             tags: true
-    # Windows release artifacts
     - <<: *release-artifacts
+      name: "Windows release artifacts"
       os: windows
-    # macOS release artifacts
     - <<: *release-artifacts
+      name: "macOS release artifacts"
       os: osx
 
 notifications:
