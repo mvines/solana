@@ -8,8 +8,9 @@ notifications:
     on_success: change
     secure: F4IjOE05MyaMOdPRL+r8qhs7jBvv4yDM3RmFKE1zNXnfUOqV4X38oQM1EI+YVsgpMQLj/pxnEB7wcTE4Bf86N6moLssEULCpvAuMVoXj4QbWdomLX+01WbFa6fLVeNQIg45NHrz2XzVBhoKOrMNnl+QI5mbR2AlS5oqsudHsXDnyLzZtd4Y5SDMdYG1zVWM01+oNNjgNfjcCGmOE/K0CnOMl6GPi3X9C34tJ19P2XT7MTDsz1/IfEF7fro2Q8DHEYL9dchJMoisXSkem5z7IDQkGzXsWdWT4NnndUvmd1MlTCE9qgoXDqRf95Qh8sB1Dz08HtvgfaosP2XjtNTfDI9BBYS15Ibw9y7PchAJE1luteNjF35EOy6OgmCLw/YpnweqfuNViBZz+yOPWXVC0kxnPIXKZ1wyH9ibeH6E4hr7a8o9SV/6SiWIlbYF+IR9jPXyTCLP/cc3sYljPWxDnhWFwFdRVIi3PbVAhVu7uWtVUO17Oc9gtGPgs/GrhOMkJfwQPXaudRJDpVZowxTX4x9kefNotlMAMRgq+Drbmgt4eEBiCNp0ITWgh17BiE1U09WS3myuduhoct85+FoVeaUkp1sxzHVtGsNQH0hcz7WcpZyOM+AwistJA/qzeEDQao5zi1eKWPbO2xAhi2rV1bDH6bPf/4lDBwLRqSiwvlWU=
 
+os: linux
 dist: bionic
-sudo: required
+language: rust
 
 jobs:
   include:
@@ -17,7 +18,6 @@ jobs:
       if: type = push
       name: "macOS release artifacts"
       os: osx
-      language: rust
       rust:
         - stable
       install:
@@ -53,6 +53,7 @@ jobs:
       os: windows
 
     - name: "web3.js"
+      if: branch = master
       language: node_js
       node_js:
         - "lts/*"
@@ -64,14 +65,8 @@ jobs:
         directories:
           - ~/.npm
 
-      branches:
-        only:
-          - mmmmmmmmmmmaster
-
-      notifications:
-        email: false
-
       before_install:
+        - travis_terminate 0
         - wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
         - sudo apt-add-repository "deb http://apt.llvm.org/bionic/ llvm-toolchain-bionic-10 main"
         - sudo apt-get update
@@ -113,8 +108,8 @@ jobs:
       deploy:
         - provider: pages
           skip-cleanup: true
-          github-token: $GITHUB_TOKEN
-          local-dir: doc
+          token: $GITHUB_TOKEN
+          local_dir: doc
           on:
             branch: master
             node_js: "lts/*"
@@ -130,7 +125,7 @@ jobs:
           file:
             - deploy/solanaWeb3.min.js
             - deploy/solanaWeb3Api.tgz
-          api_key: $GITHUB_TOKEN
+          token: $GITHUB_TOKEN
           on:
             tags: true
             node_js: "lts/*"
