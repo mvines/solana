@@ -31,6 +31,8 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+mod compression;
+mod transaction_history;
 
 use log::*;
 
@@ -647,6 +649,11 @@ fn main() {
                 .help("Use DIR for ledger location"),
         )
         .subcommand(
+            SubCommand::with_name("injest")
+            .about("Injest the ledger")
+            .arg(&starting_slot_arg)
+        )
+        .subcommand(
             SubCommand::with_name("print")
             .about("Print the ledger")
             .arg(&starting_slot_arg)
@@ -862,6 +869,40 @@ fn main() {
     });
 
     match matches.subcommand() {
+        ("injest", Some(arg_matches)) => {
+            let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
+            let blockstore = open_blockstore(
+                &ledger_path,
+                AccessType::TryPrimaryThenSecondary,
+                wal_recovery_mode,
+            );
+
+            let slot_iterator =
+                blockstore
+                    .slot_meta_iterator(starting_slot)
+                    .unwrap_or_else(|err| {
+                        eprintln!(
+                            "Failed to load entries starting from slot {}: {:?}",
+                            starting_slot, err
+                        );
+                        exit(1);
+                    });
+
+            for (slot, _slot_meta) in slot_iterator {
+                if !blockstore.is_root(slot) {
+                    continue;
+                }
+                let block = blockstore
+                    .get_confirmed_block(
+                        slot,
+                        Some(solana_transaction_status::UiTransactionEncoding::Binary),
+                    )
+                    .unwrap();
+
+                transaction_history::injest_block(slot, &block)
+                    .unwrap_or_else(|err| error!("Failed to injest block {}: {}", slot, err));
+            }
+        }
         ("print", Some(arg_matches)) => {
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
             output_ledger(

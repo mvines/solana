@@ -26,6 +26,14 @@ solana-transaction-status = { path = "../transaction-status", version = "1.1.20"
 solana-vote-program = { path = "../programs/vote", version = "1.1.20" }
 tempfile = "3.1.0"
 
+flate2 = "1.0.14"
+bincode = "1.2.1"
+zstd = "0.5.1"
+bzip2 = "0.3.3"
+enum-iterator = "0.6.0"
+serde = "1.0.112"
+serde_derive = "1.0.103"
+
 [dev-dependencies]
 assert_cmd = "1.0"
 
