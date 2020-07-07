@@ -1598,7 +1598,7 @@ impl Blockstore {
         slot: Slot,
         encoding: Option<TransactionEncoding>,
     ) -> Result<ConfirmedBlock> {
-        datapoint_info!(
+        datapoint_debug!(
             "blockstore-rpc-api",
             ("method", "get_confirmed_block".to_string(), String)
         );
