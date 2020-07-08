@@ -24,12 +24,12 @@ pub fn write_block(slot: Slot, block: &ConfirmedBlock) -> Result<usize, io::Erro
 
     let path = block_dir.join(format!("{}", bs91::encode_u64(slot)));
     //error!("block {} -> {}", path.display(), slot);
-    fs::create_dir_all(path.parent().unwrap())?;
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     let tmp_path = path.with_extension("tmp");
 
     let mut bytes_written = 0;
     {
-        let mut file = File::create(&tmp_path)?;
+        let mut file = File::create(&tmp_path).unwrap();
         let data = bincode::serialize(&compressed_data.method).unwrap();
         file.write_all(&data)?;
         bytes_written += data.len();
@@ -37,7 +37,12 @@ pub fn write_block(slot: Slot, block: &ConfirmedBlock) -> Result<usize, io::Erro
         file.write_all(&compressed_data.data)?;
         bytes_written += compressed_data.data.len();
     }
-    fs::rename(tmp_path, path)?;
+    //fs::rename(tmp_path, path).unwrap();
+    assert!(tmp_path.exists(), format!("{} does not exist: {}", tmp_path.display(), bytes_written));
+    let _ = fs::remove_file(&path);
+    assert!(!path.exists());
+    fs::rename(&tmp_path, &path).unwrap_or_else(|err| panic!("{:?}: {} -> {}", err, tmp_path.display(), path.display()));
+    assert!(path.exists());
     Ok(bytes_written)
 }
 
@@ -49,46 +54,56 @@ pub fn write_transaction_map(
     let data = bincode::serialize(&locator).unwrap();
 
     let tx_map_dir = Path::new("h/tx-map");
-    fs::create_dir_all(&tx_map_dir)?;
+    fs::create_dir_all(&tx_map_dir).unwrap();
 
     let path = tx_map_dir.join(bs91::encode_signature(signature));
-    fs::create_dir_all(path.parent().unwrap())?;
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     let tmp_path = path.with_extension("tmp");
     //error!("{} -> {:?} - {} bytes", path.display(), locator, data.len());
 
     let mut bytes_written = 0;
     {
-        let mut file = File::create(&tmp_path)?;
+        let mut file = File::create(&tmp_path).unwrap();
         file.write_all(&data)?;
         bytes_written += data.len();
     }
-    fs::rename(tmp_path, path)?;
+    //fs::rename(tmp_path, path).unwrap();
+    assert!(tmp_path.exists(), format!("{} does not exist: {}", tmp_path.display(), bytes_written));
+    let _ = fs::remove_file(&path);
+    assert!(!path.exists());
+    fs::rename(&tmp_path, &path).unwrap_or_else(|err| panic!("{:?}: {} -> {}", err, tmp_path.display(), path.display()));
+    assert!(path.exists());
     Ok(bytes_written)
 }
 
 pub fn write_by_addr(
+    path: &Path,
+/*
     address: &Pubkey,
     slot: Slot,
+    */
     signatures: &[Signature],
 ) -> Result<usize, io::Error> {
-    let by_addr_dir = Path::new("h/by-addr");
-    fs::create_dir_all(&by_addr_dir)?;
-
-    let path = by_addr_dir.join(format!("{}/{}", bs91::encode_pubkey(address), bs91::encode_u64(!slot)));
-    fs::create_dir_all(path.parent().unwrap())?;
+    //let path = by_addr_dir.join(format!("{}/{}", bs91::encode_pubkey(address), bs91::encode_u64(!slot)));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     let tmp_path = path.with_extension("tmp");
     //error!("{} - {}", path.display(), signatures.len());
 
     let mut bytes_written = 0;
     {
-        let mut file = File::create(&tmp_path)?;
+        let mut file = File::create(&tmp_path).unwrap();
         for signature in signatures {
             let data = signature.as_ref();
             file.write_all(data)?;
             bytes_written += data.len();
         }
     }
-    fs::rename(tmp_path, path)?;
+    //fs::rename(tmp_path, path).unwrap();
+    assert!(tmp_path.exists(), format!("{} does not exist: {}", tmp_path.display(), bytes_written));
+    let _ = fs::remove_file(&path);
+    assert!(!path.exists());
+    fs::rename(&tmp_path, &path).unwrap_or_else(|err| panic!("{:?}: {} -> {}", err, tmp_path.display(), path.display()));
+    assert!(path.exists());
     Ok(bytes_written)
 }
 
@@ -96,6 +111,9 @@ pub fn injest_block(slot: Slot, block: &ConfirmedBlock) -> Result<(), io::Error>
     if block_exists(slot) {
         return Ok(());
     }
+
+    let by_addr_dir = Path::new("h/by-addr");
+//    fs::create_dir_all(&by_addr_basedir)?;
 
     let mut bytes_written = 0;
 
@@ -115,8 +133,11 @@ pub fn injest_block(slot: Slot, block: &ConfirmedBlock) -> Result<(), io::Error>
 
         bytes_written += write_transaction_map(&signature, (slot, index as u32))?;
     }
+
+    let not_slot_base91 = bs91::encode_u64(!slot);
     for (address, signatures) in by_addr.into_iter() {
-        bytes_written += write_by_addr(&address, slot, &signatures)?;
+        let path = by_addr_dir.join(bs91::encode_pubkey(&address)).join(&not_slot_base91);
+        bytes_written += write_by_addr(&path, &signatures)?;
     }
     bytes_written += write_block(slot, &block)?;
 
