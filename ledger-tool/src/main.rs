@@ -31,8 +31,11 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+
+use rayon::prelude::*;
 mod compression;
 mod transaction_history;
+mod bs91;
 
 use log::*;
 
@@ -871,12 +874,11 @@ fn main() {
     match matches.subcommand() {
         ("injest", Some(arg_matches)) => {
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
-            let blockstore = open_blockstore(
-                &ledger_path,
-                AccessType::TryPrimaryThenSecondary,
-                wal_recovery_mode,
-            );
+            let blockstore = open_blockstore(&ledger_path, AccessType::TryPrimaryThenSecondary);
 
+            use solana_measure::measure::Measure;
+
+            println!("Loading slot list...");
             let slot_iterator =
                 blockstore
                     .slot_meta_iterator(starting_slot)
@@ -888,20 +890,58 @@ fn main() {
                         exit(1);
                     });
 
-            for (slot, _slot_meta) in slot_iterator {
-                if !blockstore.is_root(slot) {
-                    continue;
-                }
+            let slots: Vec<_> = slot_iterator
+                .map(|(slot, _slot_meta)| slot)
+                .filter(|slot| blockstore.is_root(*slot))
+                .collect();
+
+            info!("{} slots to injest", slots.len());
+
+            for slot_chunk in slots.chunks(1024) {
+                let mut measure_load = Measure::start("load blocks");
+
+                let blocks: Vec<_> =
+                    slot_chunk
+                        .iter()
+                        .map(|slot| {
+                            (*slot,
+                     blockstore.get_confirmed_block(
+                        *slot,
+                        Some(solana_transaction_status::UiTransactionEncoding::Binary)).unwrap())
+                        })
+                        .collect();
+                measure_load.stop();
+                println!("{} blocks loaded: {}", blocks.len(), measure_load);
+
+                let mut measure_injest = Measure::start("injest");
+                blocks.par_iter().for_each(|(slot, block)| {
+                    transaction_history::injest_block(*slot, &block)
+                        //.unwrap_or_else(|err| error!("Failed to injest block {}: {:?}", slot, err));
+                        .unwrap_or_else(|err| panic!("Failed to injest block {}: {:?}", slot, err));
+                });
+                measure_injest.stop();
+                println!("{} blocks injested: {}", blocks.len(), measure_injest);
+            }
+
+            /*
+            for (index, slot) in slots.iter().enumerate() {
+                let mut measure_load = Measure::start("get_confirmed_block");
                 let block = blockstore
                     .get_confirmed_block(
-                        slot,
+                        *slot,
                         Some(solana_transaction_status::UiTransactionEncoding::Binary),
                     )
                     .unwrap();
+                measure_load.stop();
 
-                transaction_history::injest_block(slot, &block)
+                let mut measure_injest = Measure::start("injest");
+                transaction_history::injest_block(*slot, &block)
                     .unwrap_or_else(|err| error!("Failed to injest block {}: {}", slot, err));
+                measure_injest.stop();
+
+                println!("slot {}/{}: {}, {}", index, slots.len(), measure_load, measure_injest);
             }
+            */
         }
         ("print", Some(arg_matches)) => {
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);

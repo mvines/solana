@@ -7,22 +7,12 @@ use std::{
     io::{self, Write},
     path::Path,
 };
-
-fn slot_object_name(slot: Slot) -> String {
-    let h = &format!("{:016x}", slot);
-    format!(
-        "{}/{}/{}/{}",
-        h.get(0..4).unwrap(),
-        h.get(4..8).unwrap(),
-        h.get(8..12).unwrap(),
-        h.get(12..16).unwrap()
-    )
-}
+use crate::bs91;
 
 /// Checks if information about the given confirmed slot is present
 pub fn block_exists(slot: Slot) -> bool {
-    let block_dir = Path::new("block");
-    let path = block_dir.join(format!("{}", slot_object_name(slot)));
+    let block_dir = Path::new("h/block");
+    let path = block_dir.join(format!("{}", bs91::encode_u64(slot)));
     path.exists()
 }
 
@@ -32,9 +22,10 @@ pub fn write_block(slot: Slot, block: &ConfirmedBlock) -> Result<usize, io::Erro
 
     let block_dir = Path::new("h/block");
 
-    let path = block_dir.join(format!("{}", slot_object_name(slot)));
+    let path = block_dir.join(format!("{}", bs91::encode_u64(slot)));
+    //error!("block {} -> {}", path.display(), slot);
     fs::create_dir_all(path.parent().unwrap())?;
-    let tmp_path = path.with_extension(".tmp");
+    let tmp_path = path.with_extension("tmp");
 
     let mut bytes_written = 0;
     {
@@ -50,6 +41,7 @@ pub fn write_block(slot: Slot, block: &ConfirmedBlock) -> Result<usize, io::Erro
     Ok(bytes_written)
 }
 
+
 pub fn write_transaction_map(
     signature: &Signature,
     locator: (Slot, u32),
@@ -59,9 +51,9 @@ pub fn write_transaction_map(
     let tx_map_dir = Path::new("h/tx-map");
     fs::create_dir_all(&tx_map_dir)?;
 
-    let path = tx_map_dir.join(format!("{}", signature));
+    let path = tx_map_dir.join(bs91::encode_signature(signature));
     fs::create_dir_all(path.parent().unwrap())?;
-    let tmp_path = path.with_extension(".tmp");
+    let tmp_path = path.with_extension("tmp");
     //error!("{} -> {:?} - {} bytes", path.display(), locator, data.len());
 
     let mut bytes_written = 0;
@@ -82,9 +74,9 @@ pub fn write_by_addr(
     let by_addr_dir = Path::new("h/by-addr");
     fs::create_dir_all(&by_addr_dir)?;
 
-    let path = by_addr_dir.join(format!("{}/{}", slot_object_name(!slot), address));
+    let path = by_addr_dir.join(format!("{}/{}", bs91::encode_pubkey(address), bs91::encode_u64(!slot)));
     fs::create_dir_all(path.parent().unwrap())?;
-    let tmp_path = path.with_extension(".tmp");
+    let tmp_path = path.with_extension("tmp");
     //error!("{} - {}", path.display(), signatures.len());
 
     let mut bytes_written = 0;
@@ -128,7 +120,7 @@ pub fn injest_block(slot: Slot, block: &ConfirmedBlock) -> Result<(), io::Error>
     }
     bytes_written += write_block(slot, &block)?;
 
-    error!(
+    debug!(
         "slot {}: {} transactions, {} bytes",
         slot,
         block.transactions.len(),
