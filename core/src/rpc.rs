@@ -67,6 +67,7 @@ use std::{
         Arc, Mutex, RwLock,
     },
 };
+use tokio::runtime;
 
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
     let context = RpcResponseContext { slot: bank.slot() };
@@ -104,6 +105,7 @@ pub struct JsonRpcRequestProcessor {
     cluster_info: Arc<ClusterInfo>,
     genesis_hash: Hash,
     transaction_sender: Arc<Mutex<Sender<TransactionInfo>>>,
+    runtime_handle: runtime::Handle,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -167,6 +169,7 @@ impl JsonRpcRequestProcessor {
         health: Arc<RpcHealth>,
         cluster_info: Arc<ClusterInfo>,
         genesis_hash: Hash,
+        runtime: &runtime::Runtime,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (sender, receiver) = channel();
         (
@@ -218,6 +221,7 @@ impl JsonRpcRequestProcessor {
             cluster_info,
             genesis_hash,
             transaction_sender: Arc::new(Mutex::new(sender)),
+            runtime_handle: runtime.handle().clone(),
         }
     }
 
