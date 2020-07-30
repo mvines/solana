@@ -849,7 +849,7 @@ impl JsonRpcRequestProcessor {
                 .unwrap()
                 .highest_confirmed_root();
 
-            let results = self
+            let mut results = self
                 .blockstore
                 .get_confirmed_signatures_for_address2(
                     address,
@@ -858,6 +858,25 @@ impl JsonRpcRequestProcessor {
                     limit,
                 )
                 .map_err(|err| Error::invalid_params(format!("{}", err)))?;
+
+            if results.len() < limit {
+                if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
+                    let limit = limit - results.len();
+                    let start_after = results.last().map(|x| &x.signature);
+
+                    let mut bigtable_results = self
+                        .runtime_handle
+                        .block_on(
+                            bigtable_ledger_storage.get_confirmed_signatures_for_address(
+                                &address,
+                                start_after,
+                                limit,
+                            ),
+                        )
+                        .map_err(|err| Error::invalid_params(format!("{}", err)))?;
+                    results.append(&mut bigtable_results)
+                }
+            }
 
             Ok(results.into_iter().map(|x| x.into()).collect())
         } else {
