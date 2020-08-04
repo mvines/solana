@@ -390,6 +390,8 @@ curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc": "2.0","id":1,"m
 
 ### getConfirmedSignaturesForAddress
 
+**DEPRECATED: Please use getConfirmedSignaturesForAddress2 instead**
+
 Returns a list of all the confirmed signatures for transactions involving an
 address, within a specified Slot range. Max range allowed is 10,000 Slots
 
