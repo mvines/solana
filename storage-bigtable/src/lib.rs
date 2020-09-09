@@ -318,8 +318,8 @@ impl LedgerStorage {
 
     /// Fetch a confirmed transaction
     pub async fn get_confirmed_transaction(
-        &self,
-        signature: &Signature,
+        self,
+        signature: Signature,
         encoding: UiTransactionEncoding,
     ) -> Result<Option<ConfirmedTransaction>> {
         let mut bigtable = self.connection.client();
@@ -339,7 +339,7 @@ impl LedgerStorage {
                 Ok(None)
             }
             Some(bucket_block_transaction) => {
-                if bucket_block_transaction.transaction.signatures[0] != *signature {
+                if bucket_block_transaction.transaction.signatures[0] != signature {
                     warn!(
                         "Transaction info or confirmed block for {} is corrupt",
                         signature

@@ -97,7 +97,7 @@ async fn confirm(signature: &Signature, verbose: bool) -> Result<(), Box<dyn std
 
     if verbose {
         match bigtable
-            .get_confirmed_transaction(signature, UiTransactionEncoding::Base64)
+            .get_confirmed_transaction(*signature, UiTransactionEncoding::Base64)
             .await
         {
             Ok(Some(confirmed_transaction)) => {
@@ -155,7 +155,55 @@ pub async fn transaction_history(
         assert!(limit >= results.len());
         limit = limit.saturating_sub(results.len());
 
-        for result in results {
+    // push to new thread here, one result at a time???
+
+
+    // intermediary thread
+
+
+    // pull results from final thread...
+
+
+        /*
+        - one thread to issue get_confirmed_transaction requests, send a future along
+               -- channel controls how many pending requests there are
+        - other thread pulls off the channel, waits on each and prints them...
+        */
+
+        let (_loader_thread, receiver) = {
+            let bigtable = bigtable.clone();
+            let (sender, receiver) =
+                //tokio::sync::mpsc::channel(10 /*BLOCK_READ_AHEAD_DEPTH*/);
+                std::sync::mpsc::sync_channel(32 /*BLOCK_READ_AHEAD_DEPTH*/);
+            (
+                std::thread::spawn(move || {
+               // tokio::spawn(async move {
+                    for result in results {
+                        let signature = result.signature;
+                        let bigtable = bigtable.clone();
+                        eprintln!("result sig: {}", signature);
+                        sender.send((
+                            result,
+                            if show_transactions {
+                                Some(bigtable.get_confirmed_transaction(
+                                    signature,
+                                    UiTransactionEncoding::Base64,
+                                ))
+                            } else {
+                                None
+                            },
+                        ));
+                    }
+                }),
+                receiver,
+            )
+        };
+
+        use futures::stream::StreamExt;
+        let mut stream = tokio::stream::iter(receiver.into_iter());
+
+        //while let Some((result, get_confirmed_transaction_future)) = receiver.recv().await {
+        while let Some((result, get_confirmed_transaction_future)) = stream.next().await {
             if verbose {
                 println!(
                     "{}, slot={}, memo=\"{}\", status={}",
@@ -171,11 +219,8 @@ pub async fn transaction_history(
                 println!("{}", result.signature);
             }
 
-            if show_transactions {
-                match bigtable
-                    .get_confirmed_transaction(&result.signature, UiTransactionEncoding::Base64)
-                    .await
-                {
+            if let Some(get_confirmed_transaction_future) = get_confirmed_transaction_future {
+                match get_confirmed_transaction_future.await {
                     Ok(Some(confirmed_transaction)) => {
                         println_transaction(
                             &confirmed_transaction
