@@ -1268,10 +1268,10 @@ pub fn main() {
     if restricted_repair_only_mode {
         let any = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0);
         // Don't advertise any ports in gossip.  Don't talk to me!
-        node.info.gossip = any;
+        //node.info.gossip = any;
         node.info.tvu = any;
         node.info.tvu_forwards = any;
-        node.info.repair = any;
+        //node.info.repair = any;
         node.info.tpu = any;
         node.info.tpu_forwards = any;
         node.info.serve_repair = any;
