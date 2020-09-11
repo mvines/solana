@@ -1267,7 +1267,7 @@ pub fn main() {
 
     if restricted_repair_only_mode {
         let any = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0);
-
+        // Don't advertise any ports in gossip.  Don't talk to me!
         node.info.gossip = any;
         node.info.tvu = any;
         node.info.tvu_forwards = any;
