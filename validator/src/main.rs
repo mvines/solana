@@ -142,6 +142,7 @@ fn start_gossip_node(
     gossip_addr: &SocketAddr,
     gossip_socket: UdpSocket,
     expected_shred_version: Option<u16>,
+    gossip_pull_validators: Option<HashSet<Pubkey>>,
 ) -> (Arc<ClusterInfo>, Arc<AtomicBool>, GossipService) {
     let cluster_info = ClusterInfo::new(
         ClusterInfo::gossip_contact_info(
@@ -155,7 +156,13 @@ fn start_gossip_node(
     let cluster_info = Arc::new(cluster_info);
 
     let gossip_exit_flag = Arc::new(AtomicBool::new(false));
-    let gossip_service = GossipService::new(&cluster_info, None, gossip_socket, &gossip_exit_flag);
+    let gossip_service = GossipService::new(
+        &cluster_info,
+        None,
+        gossip_socket,
+        gossip_pull_validators,
+        &gossip_exit_flag,
+    );
     (cluster_info, gossip_exit_flag, gossip_service)
 }
 
@@ -862,7 +869,19 @@ pub fn main() {
                 .multiple(true)
                 .takes_value(true)
                 .help("A list of validators to request repairs from. If specified, repair will not \
-                       request from validators outside this set [default: request repairs from all validators]")
+                       request from validators outside this set [default: all validators]")
+        )
+        .arg(
+            Arg::with_name("gossip_pull_validators")
+                .long("gossip-pull-validator")
+                .validator(is_pubkey)
+                .value_name("PUBKEY")
+                .multiple(true)
+                .takes_value(true)
+                .help("A list of validators to send gossip pull requests to.  If specified, gossip pull \
+                      requests will not be make with validators outside this set.  However the validator
+                      will always respond to gossip pull requests from any other validator regardless \
+                      [default: all validators]")
         )
         .arg(
             Arg::with_name("no_rocksdb_compaction")
@@ -979,6 +998,12 @@ pub fn main() {
         "repair_validators",
         "--repair-validator",
     );
+    let gossip_pull_validators = validators_set(
+        &identity_keypair.pubkey(),
+        &matches,
+        "gossip_pull_validators",
+        "--gossip-pull-validator",
+    );
 
     let bind_address = solana_net_utils::parse_host(matches.value_of("bind_address").unwrap())
         .expect("invalid bind_address");
@@ -1029,6 +1054,7 @@ pub fn main() {
         wait_for_supermajority: value_t!(matches, "wait_for_supermajority", Slot).ok(),
         trusted_validators,
         repair_validators,
+        gossip_pull_validators,
         frozen_accounts: values_t!(matches, "frozen_accounts", Pubkey).unwrap_or_default(),
         no_rocksdb_compaction,
         wal_recovery_mode,
@@ -1323,6 +1349,7 @@ pub fn main() {
                         &node.info.gossip,
                         node.sockets.gossip.try_clone().unwrap(),
                         validator_config.expected_shred_version,
+                        validator_config.gossip_pull_validators.clone(),
                     ));
                 }
 

@@ -1519,6 +1519,7 @@ impl ClusterInfo {
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         sender: PacketSender,
+        gossip_pull_validators: Option<HashSet<Pubkey>>,
         exit: &Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let exit = exit.clone();
@@ -1542,12 +1543,15 @@ impl ClusterInfo {
                         last_contact_info_trace = start;
                     }
 
-                    let stakes: HashMap<_, _> = match bank_forks {
+                    let mut stakes: HashMap<_, _> = match bank_forks {
                         Some(ref bank_forks) => {
                             staking_utils::staked_nodes(&bank_forks.read().unwrap().working_bank())
                         }
                         None => HashMap::new(),
                     };
+                    if let Some(gossip_pull_validators) = &gossip_pull_validators {
+                        stakes.retain(|&k, _| gossip_pull_validators.contains(&k));
+                    }
 
                     let _ = self.run_gossip(&recycler, &stakes, &sender, generate_pull_requests);
                     if exit.load(Ordering::Relaxed) {
