@@ -1899,7 +1899,15 @@ impl ClusterInfo {
         timeouts: &HashMap<Pubkey, u64>,
     ) -> (usize, usize, usize) {
         let len = crds_values.len();
-        trace!("PullResponse me: {} from: {} len={}", self.id, from, len);
+        warn!("PullResponse me: {} from: {} len={}", self.id, from, len);
+        for c in &crds_values {
+            let l = c.label();
+            match l {
+                //CrdsValueLabel::ContactInfo(_) => info!("     {} = {:?}", l, c),
+                CrdsValueLabel::ContactInfo(_) => info!("     {}", l),
+                _ => {}
+            }
+        }
         let shred_version = self
             .lookup_contact_info(from, |ci| ci.shred_version)
             .unwrap_or(0);
