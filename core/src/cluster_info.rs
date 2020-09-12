@@ -1363,13 +1363,17 @@ impl ClusterInfo {
         messages
     }
 
-    fn new_pull_requests(&self, stakes: &HashMap<Pubkey, u64>) -> Vec<(SocketAddr, Protocol)> {
+    fn new_pull_requests(
+        &self,
+        gossip_validators: Option<&HashSet<Pubkey>>,
+        stakes: &HashMap<Pubkey, u64>,
+    ) -> Vec<(SocketAddr, Protocol)> {
         let now = timestamp();
         let mut pulls: Vec<_> = {
             let r_gossip =
                 self.time_gossip_read_lock("new_pull_reqs", &self.stats.new_pull_requests);
             r_gossip
-                .new_pull_request(now, stakes, MAX_BLOOM_SIZE)
+                .new_pull_request(now, gossip_validators, stakes, MAX_BLOOM_SIZE)
                 .ok()
                 .into_iter()
                 .filter_map(|(peer, filters, me)| {
@@ -1400,7 +1404,10 @@ impl ClusterInfo {
             })
             .collect()
     }
-    fn new_push_requests(&self) -> Vec<(SocketAddr, Protocol)> {
+    fn new_push_requests(
+        &self,
+        _gossip_validators: Option<&HashSet<Pubkey>>, // mjvTODO - maybe don't care? if so, rename back to gossip_pull_validators...
+    ) -> Vec<(SocketAddr, Protocol)> {
         let self_id = self.id();
         let (_, push_messages) = self
             .time_gossip_write_lock("new_push_requests", &self.stats.new_push_requests)
@@ -1430,27 +1437,34 @@ impl ClusterInfo {
     // Generate new push and pull requests
     fn generate_new_gossip_requests(
         &self,
+        gossip_validators: Option<&HashSet<Pubkey>>,
         stakes: &HashMap<Pubkey, u64>,
         generate_pull_requests: bool,
     ) -> Vec<(SocketAddr, Protocol)> {
-        let pulls: Vec<_> = if generate_pull_requests {
-            self.new_pull_requests(stakes)
+        let mut pulls: Vec<_> = if generate_pull_requests {
+            self.new_pull_requests(gossip_validators, stakes)
         } else {
             vec![]
         };
-        let pushes: Vec<_> = self.new_push_requests();
-        vec![pulls, pushes].into_iter().flatten().collect()
+        let mut pushes: Vec<_> = self.new_push_requests(gossip_validators);
+        error!("generate_new_gossip_requests: pulls={}", pulls.len());
+        error!("generate_new_gossip_requests: pushes={}", pushes.len());
+
+        pulls.append(&mut pushes);
+        pulls
     }
 
     /// At random pick a node and try to get updated changes from them
     fn run_gossip(
         &self,
+        gossip_validators: Option<&HashSet<Pubkey>>,
         recycler: &PacketsRecycler,
         stakes: &HashMap<Pubkey, u64>,
         sender: &PacketSender,
         generate_pull_requests: bool,
     ) -> Result<()> {
-        let reqs = self.generate_new_gossip_requests(&stakes, generate_pull_requests);
+        let reqs =
+            self.generate_new_gossip_requests(gossip_validators, &stakes, generate_pull_requests);
         if !reqs.is_empty() {
             let packets = to_packets_with_destination(recycler.clone(), &reqs);
             sender.send(packets)?;
@@ -1519,7 +1533,7 @@ impl ClusterInfo {
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         sender: PacketSender,
-        gossip_pull_validators: Option<HashSet<Pubkey>>,
+        gossip_validators: Option<HashSet<Pubkey>>,
         exit: &Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let exit = exit.clone();
@@ -1543,17 +1557,20 @@ impl ClusterInfo {
                         last_contact_info_trace = start;
                     }
 
-                    let mut stakes: HashMap<_, _> = match bank_forks {
+                    let stakes: HashMap<_, _> = match bank_forks {
                         Some(ref bank_forks) => {
                             staking_utils::staked_nodes(&bank_forks.read().unwrap().working_bank())
                         }
                         None => HashMap::new(),
                     };
-                    if let Some(gossip_pull_validators) = &gossip_pull_validators {
-                        stakes.retain(|&k, _| gossip_pull_validators.contains(&k));
-                    }
 
-                    let _ = self.run_gossip(&recycler, &stakes, &sender, generate_pull_requests);
+                    let _ = self.run_gossip(
+                        gossip_validators.as_ref(),
+                        &recycler,
+                        &stakes,
+                        &sender,
+                        generate_pull_requests,
+                    );
                     if exit.load(Ordering::Relaxed) {
                         return;
                     }
@@ -1582,6 +1599,7 @@ impl ClusterInfo {
     #[allow(clippy::cognitive_complexity)]
     fn handle_packets(
         &self,
+        gossip_validators: Option<&HashSet<Pubkey>>,
         recycler: &PacketsRecycler,
         stakes: &HashMap<Pubkey, u64>,
         packets: Packets,
@@ -1663,7 +1681,13 @@ impl ClusterInfo {
                             }
                             ret
                         });
-                        let rsp = self.handle_push_message(recycler, &from, data, stakes);
+                        let rsp = self.handle_push_message(
+                            gossip_validators,
+                            recycler,
+                            &from,
+                            data,
+                            stakes,
+                        );
                         if let Some(rsp) = rsp {
                             let _ignore_disconnect = response_sender.send(rsp);
                         }
@@ -1949,6 +1973,7 @@ impl ClusterInfo {
 
     fn handle_push_message(
         &self,
+        gossip_validators: Option<&HashSet<Pubkey>>,
         recycler: &PacketsRecycler,
         from: &Pubkey,
         mut crds_values: Vec<CrdsValue>,
@@ -2010,7 +2035,7 @@ impl ClusterInfo {
             .push_response_count
             .add_relaxed(packets.packets.len() as u64);
         if !packets.is_empty() {
-            let pushes: Vec<_> = self.new_push_requests();
+            let pushes: Vec<_> = self.new_push_requests(gossip_validators);
             inc_new_counter_debug!("cluster_info-push_message-pushes", pushes.len());
             pushes.into_iter().for_each(|(remote_gossip_addr, req)| {
                 if !remote_gossip_addr.ip().is_unspecified() && remote_gossip_addr.port() != 0 {
@@ -2050,6 +2075,7 @@ impl ClusterInfo {
 
     fn process_packets(
         &self,
+        gossip_validators: Option<&HashSet<Pubkey>>,
         requests: Vec<Packets>,
         thread_pool: &ThreadPool,
         recycler: &PacketsRecycler,
@@ -2060,7 +2086,14 @@ impl ClusterInfo {
         let sender = response_sender.clone();
         thread_pool.install(|| {
             requests.into_par_iter().for_each_with(sender, |s, reqs| {
-                self.handle_packets(&recycler, &stakes, reqs, s, epoch_time_ms)
+                self.handle_packets(
+                    gossip_validators,
+                    &recycler,
+                    &stakes,
+                    reqs,
+                    s,
+                    epoch_time_ms,
+                )
             });
         });
     }
@@ -2068,6 +2101,7 @@ impl ClusterInfo {
     /// Process messages from the network
     fn run_listen(
         &self,
+        gossip_validators: Option<&HashSet<Pubkey>>,
         recycler: &PacketsRecycler,
         bank_forks: Option<&Arc<RwLock<BankForks>>>,
         requests_receiver: &PacketReceiver,
@@ -2096,6 +2130,7 @@ impl ClusterInfo {
         let (stakes, epoch_time_ms) = Self::get_stakes_and_epoch_time(bank_forks);
 
         self.process_packets(
+            gossip_validators,
             requests,
             thread_pool,
             recycler,
@@ -2304,6 +2339,7 @@ impl ClusterInfo {
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         requests_receiver: PacketReceiver,
         response_sender: PacketSender,
+        gossip_validators: Option<HashSet<Pubkey>>,
         exit: &Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let exit = exit.clone();
@@ -2319,6 +2355,7 @@ impl ClusterInfo {
                 let mut last_print = Instant::now();
                 loop {
                     let e = self.run_listen(
+                        gossip_validators.as_ref(),
                         &recycler,
                         bank_forks.as_ref(),
                         &requests_receiver,

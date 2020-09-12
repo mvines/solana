@@ -130,6 +130,7 @@ impl CrdsGossip {
     pub fn new_pull_request(
         &self,
         now: u64,
+        gossip_validators: Option<&HashSet<Pubkey>>,
         stakes: &HashMap<Pubkey, u64>,
         bloom_size: usize,
     ) -> Result<(Pubkey, Vec<CrdsFilter>, CrdsValue), CrdsGossipError> {
@@ -138,6 +139,7 @@ impl CrdsGossip {
             &self.id,
             self.shred_version,
             now,
+            gossip_validators,
             stakes,
             bloom_size,
         )

@@ -32,7 +32,7 @@ impl GossipService {
         cluster_info: &Arc<ClusterInfo>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         gossip_socket: UdpSocket,
-        gossip_pull_validators: Option<HashSet<Pubkey>>,
+        gossip_validators: Option<HashSet<Pubkey>>,
         exit: &Arc<AtomicBool>,
     ) -> Self {
         let (request_sender, request_receiver) = channel();
@@ -56,13 +56,14 @@ impl GossipService {
             bank_forks.clone(),
             request_receiver,
             response_sender.clone(),
+            gossip_validators.clone(),
             exit,
         );
         let t_gossip = ClusterInfo::gossip(
             cluster_info.clone(),
             bank_forks,
             response_sender,
-            gossip_pull_validators,
+            gossip_validators,
             exit,
         );
         let thread_hdls = vec![t_receiver, t_responder, t_listen, t_gossip];
