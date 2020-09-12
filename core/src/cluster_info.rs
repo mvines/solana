@@ -1272,12 +1272,14 @@ impl ClusterInfo {
             let mut w_entrypoint = self.entrypoint.write().unwrap();
             if let Some(ref mut entrypoint) = &mut *w_entrypoint {
                 if pulls.is_empty() {
+                    error!("slowmo: Nobody else to pull from, try the entrypoint");
                     // Nobody else to pull from, try the entrypoint
                     true
                 } else {
                     let now = timestamp();
                     // Only consider pulling from the entrypoint periodically to avoid spamming it
                     if timestamp() - entrypoint.wallclock <= CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS / 2 {
+                        error!("slowmo: avoid spamming entrypoint: {}", timestamp() - entrypoint.wallclock );
                         false
                     } else {
                         entrypoint.wallclock = now;
@@ -1292,10 +1294,16 @@ impl ClusterInfo {
                                     .map(|ci| ci.gossip == entrypoint.gossip)
                                     .unwrap_or(false)
                             });
+                        if found_entrypoint {
+                            error!("slowmo: want to pull from entrypoint but found it");
+                        } else {
+                            error!("slowmo: gonna pull from entrypoint");
+                        }
                         !found_entrypoint
                     }
                 }
             } else {
+                error!("slowmo: no entrypoint!");
                 false
             }
         };
