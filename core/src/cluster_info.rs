@@ -1406,7 +1406,7 @@ impl ClusterInfo {
     }
     fn new_push_requests(
         &self,
-        _gossip_validators: Option<&HashSet<Pubkey>>, // mjvTODO - maybe don't care? if so, rename back to gossip_pull_validators...
+        gossip_validators: Option<&HashSet<Pubkey>>,
     ) -> Vec<(SocketAddr, Protocol)> {
         let self_id = self.id();
         let (_, push_messages) = self
@@ -1415,6 +1415,12 @@ impl ClusterInfo {
         let messages: Vec<_> = push_messages
             .into_iter()
             .filter_map(|(peer, messages)| {
+                if let Some(gossip_validators) = gossip_validators {
+                    if !gossip_validators.contains(&peer) {
+                        return None;
+                    }
+                }
+
                 let peer_label = CrdsValueLabel::ContactInfo(peer);
                 self.time_gossip_read_lock("push_req_lookup", &self.stats.new_push_requests2)
                     .crds
@@ -2897,7 +2903,7 @@ mod tests {
             .gossip
             .write()
             .unwrap()
-            .new_push_messages(timestamp());
+            .new_push_messages(None, timestamp());
         // there should be some pushes ready
         assert_eq!(push_messages.is_empty(), false);
         push_messages
