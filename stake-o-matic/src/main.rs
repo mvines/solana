@@ -1,3 +1,23 @@
+use log::*;
+use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_sdk::{
+    clock::Slot,
+    commitment_config::CommitmentConfig,
+    hash::Hash,
+    native_token::*,
+    signature::{read_keypair_file, Keypair, Signature, Signer},
+    system_transaction,
+};
+use std::{
+    collections::VecDeque,
+    error,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, RwLock},
+    thread::{self, Builder, JoinHandle},
+    time::{Duration, Instant},
+};
+
+/*
 use clap::{crate_description, crate_name, crate_version, value_t, value_t_or_exit, App, Arg};
 use log::*;
 use solana_clap_utils::{
@@ -890,6 +910,195 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     ) {
         process::exit(1);
     }
+
+    Ok(())
+}
+*/
+
+#[derive(Debug)]
+struct TransactionProbe {
+    blockhash: Hash,
+    last_valid_slot: Slot,
+    signature: Signature,
+    transmit_time: Instant,
+}
+
+struct TransactionProbeService {
+    thread: JoinHandle<()>,
+    last_sucessful_probe: Arc<RwLock<Option<Instant>>>,
+}
+
+impl TransactionProbeService {
+    pub fn new(
+        rpc_client: RpcClient,
+        probe_keypair: Keypair,
+        probe_interval: Duration,
+        /*
+        runtime_handle: runtime::Handle,
+        bigtable_ledger_storage: solana_storage_bigtable::LedgerStorage,
+        blockstore: Arc<Blockstore>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        */
+        exit: Arc<AtomicBool>,
+    ) -> Self {
+        info!(
+            "Starting transaction probe service.  Probe interval: {:?}",
+            probe_interval
+        );
+
+        let last_sucessful_probe = Arc::new(RwLock::new(None));
+        let thread = {
+            let last_sucessful_probe = last_sucessful_probe.clone();
+
+            Builder::new()
+                .name("tx-probe".to_string())
+                .spawn(move || {
+                    Self::run(
+                        rpc_client,
+                        probe_keypair,
+                        probe_interval,
+                        last_sucessful_probe,
+                        /*
+                        runtime_handle,
+                        bigtable_ledger_storage,
+                        blockstore,
+                        block_commitment_cache,
+                        */
+                        exit,
+                    )
+                })
+                .unwrap()
+        };
+
+        Self {
+            thread,
+            last_sucessful_probe,
+        }
+    }
+
+    fn run(
+        rpc_client: RpcClient,
+        probe_keypair: Keypair,
+        probe_interval: Duration,
+        last_sucessful_probe: Arc<RwLock<Option<Instant>>>,
+        /*
+        runtime: runtime::Handle,
+        bigtable_ledger_storage: solana_storage_bigtable::LedgerStorage,
+        blockstore: Arc<Blockstore>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        */
+        exit: Arc<AtomicBool>,
+    ) {
+        let mut probes = VecDeque::<TransactionProbe>::new();
+
+        loop {
+            thread::sleep(probe_interval);
+            if exit.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let balance = rpc_client.get_balance(&probe_keypair.pubkey()).unwrap();
+            if lamports_to_sol(balance) < 1. {
+                warn!(
+                    "Probe account balance is low: {} SOL",
+                    lamports_to_sol(balance),
+                );
+            }
+
+            let slot = rpc_client
+                .get_slot_with_commitment(CommitmentConfig::max())
+                .unwrap();
+
+            // From newest (front) to oldest (back), search for the first confirmed transaction.
+            // Remove all older transactions
+            let mut split_off_index = None;
+            for (index, probe) in probes.iter().enumerate() {
+                if let Ok(response) = rpc_client.confirm_transaction_with_commitment(
+                    &probe.signature,
+                    CommitmentConfig::recent(),
+                ) {
+                    if response.value {
+                        let now = Instant::now();
+                        let duration = now.duration_since(probe.transmit_time);
+                        info!("confirmed {} in {:?}", probe.signature, duration);
+                        *last_sucessful_probe.write().unwrap() = Some(now);
+
+                        split_off_index = Some(index);
+                        break;
+                    }
+                }
+                if probe.last_valid_slot < slot {
+                    info!("probe at index {} has expired: {:?}", index, probe);
+                    split_off_index = Some(index);
+                    break;
+                }
+            }
+
+            if let Some(split_off_index) = split_off_index {
+                let _ = probes.split_off(split_off_index);
+            }
+            info!("probes len={}", probes.len());
+
+            let (blockhash, _fee_calculator, last_valid_slot) = rpc_client
+                .get_recent_blockhash_with_commitment(CommitmentConfig::max())
+                .unwrap()
+                .value;
+
+            if let Some(last_probe) = probes.front() {
+                if last_probe.blockhash == blockhash {
+                    warn!("Max confirmed blockhash stuck at {}", blockhash);
+                    continue;
+                }
+            }
+
+            let transaction =
+                system_transaction::transfer(&probe_keypair, &probe_keypair.pubkey(), 0, blockhash);
+
+            let transmit_time = Instant::now();
+            // TOOD: easy to use STS without retries?
+            let signature = rpc_client
+                .send_transaction_with_config(
+                    &transaction,
+                    RpcSendTransactionConfig {
+                        //skip_preflight: true,
+                        ..RpcSendTransactionConfig::default()
+                    },
+                )
+                .unwrap();
+            info!("Sent probe: {}", signature);
+
+            probes.push_front(TransactionProbe {
+                blockhash,
+                last_valid_slot,
+                signature,
+                transmit_time,
+            });
+        }
+    }
+
+    // When the last successful transaction probe was recorded.  The granularity of this Instant
+    // is the `probe_interval` parameter passed into `TransactionProbeService::new()`
+    pub fn last_sucessful_probe(&self) -> Option<Instant> {
+        *self.last_sucessful_probe.read().unwrap()
+    }
+
+    pub fn join(self) -> thread::Result<()> {
+        self.thread.join()
+    }
+}
+
+fn main() -> Result<(), Box<dyn error::Error>> {
+    solana_logger::setup_with_default("solana=info");
+
+    let config = solana_cli_config::Config::default();
+    //let rpc_client = RpcClient::new(config.json_rpc_url.clone());
+    let rpc_client = RpcClient::new("http://devnet.solana.com".to_string());
+    let keypair = read_keypair_file(dbg!(&config.keypair_path)).unwrap();
+
+    let exit = Arc::new(AtomicBool::new(false));
+
+    let tps = TransactionProbeService::new(rpc_client, keypair, Duration::from_secs(1), exit);
+    tps.join().unwrap();
 
     Ok(())
 }
