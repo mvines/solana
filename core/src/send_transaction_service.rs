@@ -28,6 +28,7 @@ pub struct TransactionInfo {
     pub signature: Signature,
     pub wire_transaction: Vec<u8>,
     pub last_valid_slot: Slot,
+    pub retry_enabled: bool,
 }
 
 impl TransactionInfo {
@@ -36,6 +37,7 @@ impl TransactionInfo {
             signature,
             wire_transaction,
             last_valid_slot,
+            retry_enabled: true,
         }
     }
 }
@@ -132,10 +134,12 @@ impl SendTransactionService {
                         address,
                         &transaction_info.wire_transaction,
                     );
-                    if transactions.len() < MAX_TRANSACTION_QUEUE_SIZE {
-                        transactions.insert(transaction_info.signature, transaction_info);
-                    } else {
-                        datapoint_warn!("send_transaction_service-queue-overflow");
+                    if transaction_info.retry_enabled {
+                        if transactions.len() < MAX_TRANSACTION_QUEUE_SIZE {
+                            transactions.insert(transaction_info.signature, transaction_info);
+                        } else {
+                            datapoint_warn!("send_transaction_service-queue-overflow");
+                        }
                     }
                 }
 
