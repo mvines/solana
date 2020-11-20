@@ -120,6 +120,9 @@ pub enum CliCommand {
     },
     LeaderSchedule,
     LiveSlots,
+    Logs {
+        address: Pubkey,
+    },
     Ping {
         lamports: u64,
         interval: Duration,
@@ -582,6 +585,7 @@ pub fn parse_command(
             command: CliCommand::LiveSlots,
             signers: vec![],
         }),
+        ("logs", Some(matches)) => parse_logs(matches, wallet_manager),
         ("block-production", Some(matches)) => parse_show_block_production(matches),
         ("gossip", Some(_matches)) => Ok(CliCommandInfo {
             command: CliCommand::ShowGossip,
@@ -1545,7 +1549,8 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             process_inflation_subcommand(&rpc_client, config, inflation_subcommand)
         }
         CliCommand::LeaderSchedule => process_leader_schedule(&rpc_client),
-        CliCommand::LiveSlots => process_live_slots(&config.websocket_url),
+        CliCommand::LiveSlots => process_live_slots(&config),
+        CliCommand::Logs { address } => process_logs(&config, *address),
         CliCommand::Ping {
             lamports,
             interval,

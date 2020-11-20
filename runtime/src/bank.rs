@@ -114,7 +114,13 @@ pub const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
 
 pub const MAX_LEADER_SCHEDULE_STAKES: Epoch = 5;
 
-pub const TRANSACTION_LOG_MESSAGES_BYTES_LIMIT: usize = 100 * 1000;
+pub const TRANSACTION_LOG_MESSAGES_BYTES_LIMIT: usize = 10 * 1000; // 10KB
+
+// Maximum number of transaction logs that will be stored in `Bank::transaction_logs`.
+//
+// To estimate the approximate worst case memory usage for transaction logs held by a Bank,
+// multiply this value by `TRANSACTION_LOG_MESSAGES_BYTES_LIMIT`
+pub const MAX_TRANSACTION_LOGS: usize = 100;
 
 type BankStatusCache = StatusCache<Result<()>>;
 #[frozen_abi(digest = "4nZ6EdivqQPcnrnXisbjuTjpcUBoHLDEQWvbZQDCoQQR")]
@@ -407,6 +413,16 @@ pub type InnerInstructionsList = Vec<InnerInstructions>;
 
 /// A list of log messages emitted during a transaction
 pub type TransactionLogMessages = Vec<String>;
+
+#[derive(Clone, Debug)]
+pub struct TransactionLog {
+    pub signature: Signature,
+    pub result: Result<()>,
+    pub log_messages: TransactionLogMessages,
+}
+
+// List of addresses and the log from the transactions that referenced them
+pub type TransactionLogs = Vec<(Pubkey, TransactionLog)>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HashAgeKind {
@@ -711,6 +727,13 @@ pub struct Bank {
 
     transaction_debug_keys: Option<Arc<HashSet<Pubkey>>>,
 
+    // Store the logs from transactions that touch these keys into `transaction_logs`
+    pub transaction_log_keys: Arc<RwLock<HashSet<Pubkey>>>,
+
+    // Logs from transactions that this Bank executed that referenced accounts found in `transaction_log_keys`
+    // (up to `MAX_TRANSACTION_LOGS` entries)
+    pub transaction_logs: Arc<RwLock<TransactionLogs>>,
+
     pub feature_set: Arc<FeatureSet>,
 }
 
@@ -855,6 +878,8 @@ impl Bank {
             rewards_pool_pubkeys: parent.rewards_pool_pubkeys.clone(),
             cached_executors: RwLock::new((*parent.cached_executors.read().unwrap()).clone()),
             transaction_debug_keys: parent.transaction_debug_keys.clone(),
+            transaction_log_keys: parent.transaction_log_keys.clone(),
+            transaction_logs: Arc::new(RwLock::new(vec![])),
             feature_set: parent.feature_set.clone(),
         };
 
@@ -971,6 +996,8 @@ impl Bank {
                 CachedExecutors::new(MAX_CACHED_EXECUTORS),
             )))),
             transaction_debug_keys: debug_keys,
+            transaction_log_keys: new(),
+            transaction_logs: new(),
             feature_set: new(),
         };
         bank.finish_init(genesis_config, additional_builtins);
@@ -2104,7 +2131,10 @@ impl Bank {
     }
 
     /// Run transactions against a frozen bank without committing the results
-    pub fn simulate_transaction(&self, transaction: Transaction) -> (Result<()>, Vec<String>) {
+    pub fn simulate_transaction(
+        &self,
+        transaction: Transaction,
+    ) -> (Result<()>, TransactionLogMessages) {
         assert!(self.is_frozen(), "simulation bank must be frozen");
 
         let txs = &[transaction];
@@ -2601,7 +2631,7 @@ impl Bank {
         let mut signature_count: u64 = 0;
         let mut inner_instructions: Vec<Option<InnerInstructionsList>> =
             Vec::with_capacity(txs.len());
-        let mut transaction_logs: Vec<TransactionLogMessages> = Vec::with_capacity(txs.len());
+        let mut transaction_log_messages = Vec::with_capacity(txs.len());
         let bpf_compute_budget = self
             .bpf_compute_budget
             .unwrap_or_else(|| BpfComputeBudget::new(&self.feature_set));
@@ -2655,10 +2685,10 @@ impl Bank {
                         Self::truncate_log_messages(
                             &mut log_messages,
                             TRANSACTION_LOG_MESSAGES_BYTES_LIMIT,
-                            String::from("<< Transaction log truncated to 100KB >>\n"),
+                            String::from("<< Transaction log truncated >>\n"),
                         );
 
-                        transaction_logs.push(log_messages);
+                        transaction_log_messages.push(log_messages);
                     }
 
                     Self::compile_recorded_instructions(
@@ -2695,12 +2725,35 @@ impl Bank {
 
         let mut tx_count: u64 = 0;
         let err_count = &mut error_counters.total;
-        for ((r, _hash_age_kind), tx) in executed.iter().zip(txs.iter()) {
+        let transaction_log_keys = self.transaction_log_keys.read().unwrap();
+
+        for (i, ((r, _hash_age_kind), tx)) in executed.iter().zip(txs.iter()).enumerate() {
             if let Some(debug_keys) = &self.transaction_debug_keys {
                 for key in &tx.message.account_keys {
                     if debug_keys.contains(key) {
                         info!("slot: {} result: {:?} tx: {:?}", self.slot, r, tx);
                         break;
+                    }
+                }
+            }
+            if enable_log_recording && !transaction_log_keys.is_empty() {
+                for key in &tx.message.account_keys {
+                    if transaction_log_keys.contains(key) {
+                        if let Some(log_messages) = transaction_log_messages.get(i) {
+                            let mut w = self.transaction_logs.write().unwrap();
+                            w.push((
+                                *key,
+                                TransactionLog {
+                                    signature: tx.signatures[0],
+                                    result: r.clone(),
+                                    log_messages: log_messages.clone(),
+                                },
+                            ));
+                            if w.len() >= MAX_TRANSACTION_LOGS {
+                                warn!("Transaction logs truncated");
+                                w.truncate(MAX_TRANSACTION_LOGS);
+                            }
+                        }
                     }
                 }
             }
@@ -2725,7 +2778,7 @@ impl Bank {
             loaded_accounts,
             executed,
             inner_instructions,
-            transaction_logs,
+            transaction_log_messages,
             retryable_txs,
             tx_count,
             signature_count,
@@ -3679,6 +3732,21 @@ impl Bank {
         self.rc
             .accounts
             .load_by_program_slot(self.slot(), Some(program_id))
+    }
+
+    pub fn get_transaction_logs(&self, address: &Pubkey) -> TransactionLogs {
+        self.transaction_logs
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|log| {
+                if *address == log.0 {
+                    Some(log.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
     }
 
     pub fn get_all_accounts_modified_since_parent(&self) -> Vec<(Pubkey, Account)> {

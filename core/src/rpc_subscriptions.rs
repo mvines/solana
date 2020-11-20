@@ -13,16 +13,19 @@ use jsonrpc_pubsub::{
 use serde::Serialize;
 use solana_account_decoder::{parse_token::spl_token_id_v2_0, UiAccount, UiAccountEncoding};
 use solana_client::{
-    rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSignatureSubscribeConfig},
+    rpc_config::{
+        RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSignatureSubscribeConfig,
+        RpcTransactionLogsConfig,
+    },
     rpc_filter::RpcFilterType,
     rpc_response::{
         ProcessedSignatureResult, ReceivedSignatureResult, Response, RpcKeyedAccount,
-        RpcResponseContext, RpcSignatureResult, SlotInfo,
+        RpcLogsResult, RpcResponseContext, RpcSignatureResult, SlotInfo,
     },
 };
 use solana_measure::measure::Measure;
 use solana_runtime::{
-    bank::Bank,
+    bank::{Bank, TransactionLogs},
     bank_forks::BankForks,
     commitment::{BlockCommitmentCache, CommitmentSlots},
 };
@@ -35,16 +38,16 @@ use solana_sdk::{
     transaction,
 };
 use solana_vote_program::vote_state::Vote;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, RecvTimeoutError, SendError, Sender},
-};
-use std::thread::{Builder, JoinHandle};
-use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     iter,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SendError, Sender},
+    },
     sync::{Arc, Mutex, RwLock},
+    thread::{Builder, JoinHandle},
+    time::Duration,
 };
 
 // Stuck on tokio 0.1 until the jsonrpc-pubsub crate upgrades to tokio 0.2
@@ -103,6 +106,8 @@ type RpcAccountSubscriptions = RwLock<
         HashMap<SubscriptionId, SubscriptionData<Response<UiAccount>, UiAccountEncoding>>,
     >,
 >;
+type RpcLogsSubscriptions =
+    RwLock<HashMap<Pubkey, HashMap<SubscriptionId, SubscriptionData<Response<RpcLogsResult>, ()>>>>;
 type RpcProgramSubscriptions = RwLock<
     HashMap<
         Pubkey,
@@ -183,7 +188,7 @@ where
     S: Clone + Serialize,
     B: Fn(&Bank, &K) -> X,
     F: Fn(X, &K, Slot, Option<T>, Arc<Bank>) -> (Box<dyn Iterator<Item = S>>, Slot),
-    X: Clone + Serialize + Default,
+    X: Clone + Default,
     T: Clone,
 {
     let mut notified_set: HashSet<SubscriptionId> = HashSet::new();
@@ -322,12 +327,31 @@ fn filter_program_results(
     (accounts, last_notified_slot)
 }
 
+fn filter_logs_results(
+    transaction_logs: TransactionLogs,
+    _address: &Pubkey,
+    last_notified_slot: Slot,
+    _config: Option<()>,
+    _bank: Arc<Bank>,
+) -> (Box<dyn Iterator<Item = RpcLogsResult>>, Slot) {
+    (
+        Box::new(transaction_logs.into_iter().map(|log| RpcLogsResult {
+            signature: log.1.signature.to_string(),
+            err: log.1.result.err(),
+            logs: log.1.log_messages,
+        })),
+        last_notified_slot,
+    )
+}
+
 #[derive(Clone)]
 struct Subscriptions {
     account_subscriptions: Arc<RpcAccountSubscriptions>,
     program_subscriptions: Arc<RpcProgramSubscriptions>,
+    logs_subscriptions: Arc<RpcLogsSubscriptions>,
     signature_subscriptions: Arc<RpcSignatureSubscriptions>,
     gossip_account_subscriptions: Arc<RpcAccountSubscriptions>,
+    gossip_logs_subscriptions: Arc<RpcLogsSubscriptions>,
     gossip_program_subscriptions: Arc<RpcProgramSubscriptions>,
     gossip_signature_subscriptions: Arc<RpcSignatureSubscriptions>,
     slot_subscriptions: Arc<RpcSlotSubscriptions>,
@@ -384,9 +408,11 @@ impl RpcSubscriptions {
         ) = std::sync::mpsc::channel();
 
         let account_subscriptions = Arc::new(RpcAccountSubscriptions::default());
+        let logs_subscriptions = Arc::new(RpcLogsSubscriptions::default());
         let program_subscriptions = Arc::new(RpcProgramSubscriptions::default());
         let signature_subscriptions = Arc::new(RpcSignatureSubscriptions::default());
         let gossip_account_subscriptions = Arc::new(RpcAccountSubscriptions::default());
+        let gossip_logs_subscriptions = Arc::new(RpcLogsSubscriptions::default());
         let gossip_program_subscriptions = Arc::new(RpcProgramSubscriptions::default());
         let gossip_signature_subscriptions = Arc::new(RpcSignatureSubscriptions::default());
         let slot_subscriptions = Arc::new(RpcSlotSubscriptions::default());
@@ -399,9 +425,11 @@ impl RpcSubscriptions {
         let exit_clone = exit.clone();
         let subscriptions = Subscriptions {
             account_subscriptions,
+            logs_subscriptions,
             program_subscriptions,
             signature_subscriptions,
             gossip_account_subscriptions,
+            gossip_logs_subscriptions,
             gossip_program_subscriptions,
             gossip_signature_subscriptions,
             slot_subscriptions,
@@ -471,6 +499,25 @@ impl RpcSubscriptions {
             commitment_slots,
             Bank::get_account_modified_slot,
             filter_account_result,
+            notifier,
+        )
+    }
+
+    fn check_logs(
+        address: &Pubkey,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        logs_subscriptions: Arc<RpcLogsSubscriptions>,
+        notifier: &RpcNotifier,
+        commitment_slots: &CommitmentSlots,
+    ) -> HashSet<SubscriptionId> {
+        let subscriptions = logs_subscriptions.read().unwrap();
+        check_commitment_and_notify(
+            &subscriptions,
+            address,
+            bank_forks,
+            commitment_slots,
+            Bank::get_transaction_logs,
+            filter_logs_results,
             notifier,
         )
     }
@@ -644,6 +691,89 @@ impl RpcSubscriptions {
                 .unwrap();
             remove_subscription(&mut subscriptions, id)
         }
+    }
+
+    pub fn add_logs_subscription(
+        &self,
+        address: Pubkey,
+        config: Option<RpcTransactionLogsConfig>,
+        sub_id: SubscriptionId,
+        subscriber: Subscriber<Response<RpcLogsResult>>,
+    ) {
+        let config = config.unwrap_or_default();
+        let commitment_level = config
+            .commitment
+            .unwrap_or_else(CommitmentConfig::recent)
+            .commitment;
+
+        {
+            let mut subscriptions = if commitment_level == CommitmentLevel::SingleGossip {
+                self.subscriptions
+                    .gossip_logs_subscriptions
+                    .write()
+                    .unwrap()
+            } else {
+                self.subscriptions.logs_subscriptions.write().unwrap()
+            };
+            add_subscription(
+                &mut subscriptions,
+                address,
+                config.commitment,
+                sub_id,
+                subscriber,
+                0, // last_notified_slot is not utilized for logs subscriptions
+                None,
+            );
+        }
+        self.update_bank_transaction_log_keys();
+    }
+
+    pub fn remove_logs_subscription(&self, id: &SubscriptionId) -> bool {
+        let mut removed = {
+            let mut subscriptions = self.subscriptions.logs_subscriptions.write().unwrap();
+            remove_subscription(&mut subscriptions, id)
+        };
+
+        if !removed {
+            removed = {
+                let mut subscriptions = self
+                    .subscriptions
+                    .gossip_logs_subscriptions
+                    .write()
+                    .unwrap();
+                remove_subscription(&mut subscriptions, id)
+            };
+        }
+
+        if removed {
+            self.update_bank_transaction_log_keys();
+        }
+        removed
+    }
+
+    fn update_bank_transaction_log_keys(&self) {
+        // Grab a write lock for both `logs_subscriptions` and `gossip_logs_subscriptions`, to
+        // ensure `Bank::transaction_log_keys` is updated atomically.
+        let logs_subscriptions = self.subscriptions.logs_subscriptions.write().unwrap();
+        let gossip_logs_subscriptions = self
+            .subscriptions
+            .gossip_logs_subscriptions
+            .write()
+            .unwrap();
+
+        let transaction_log_keys = logs_subscriptions
+            .keys()
+            .cloned()
+            .chain(gossip_logs_subscriptions.keys().cloned())
+            .collect::<HashSet<_>>();
+        *self
+            .bank_forks
+            .read()
+            .unwrap()
+            .root_bank()
+            .transaction_log_keys
+            .write()
+            .unwrap() = transaction_log_keys;
     }
 
     pub fn add_signature_subscription(
@@ -847,8 +977,9 @@ impl RpcSubscriptions {
                         }
                     }
                     NotificationEntry::Bank(commitment_slots) => {
-                        RpcSubscriptions::notify_accounts_programs_signatures(
+                        RpcSubscriptions::notify_accounts_logs_programs_signatures(
                             &subscriptions.account_subscriptions,
+                            &subscriptions.logs_subscriptions,
                             &subscriptions.program_subscriptions,
                             &subscriptions.signature_subscriptions,
                             &bank_forks,
@@ -894,8 +1025,9 @@ impl RpcSubscriptions {
             highest_confirmed_slot: slot,
             ..CommitmentSlots::default()
         };
-        RpcSubscriptions::notify_accounts_programs_signatures(
+        RpcSubscriptions::notify_accounts_logs_programs_signatures(
             &subscriptions.gossip_account_subscriptions,
+            &subscriptions.gossip_logs_subscriptions,
             &subscriptions.gossip_program_subscriptions,
             &subscriptions.gossip_signature_subscriptions,
             bank_forks,
@@ -905,8 +1037,9 @@ impl RpcSubscriptions {
         );
     }
 
-    fn notify_accounts_programs_signatures(
+    fn notify_accounts_logs_programs_signatures(
         account_subscriptions: &Arc<RpcAccountSubscriptions>,
+        logs_subscriptions: &Arc<RpcLogsSubscriptions>,
         program_subscriptions: &Arc<RpcProgramSubscriptions>,
         signature_subscriptions: &Arc<RpcSignatureSubscriptions>,
         bank_forks: &Arc<RwLock<BankForks>>,
@@ -931,6 +1064,24 @@ impl RpcSubscriptions {
             .len();
         }
         accounts_time.stop();
+
+        let mut logs_time = Measure::start("logs");
+        let logs: Vec<_> = {
+            let subs = logs_subscriptions.read().unwrap();
+            subs.keys().cloned().collect()
+        };
+        let mut num_logs_notified = 0;
+        for address in &logs {
+            num_logs_notified += Self::check_logs(
+                address,
+                bank_forks,
+                logs_subscriptions.clone(),
+                &notifier,
+                &commitment_slots,
+            )
+            .len();
+        }
+        logs_time.stop();
 
         let mut programs_time = Measure::start("programs");
         let programs: Vec<_> = {
@@ -990,6 +1141,9 @@ impl RpcSubscriptions {
                 ("num_account_subscriptions", pubkeys.len(), i64),
                 ("num_account_pubkeys_notified", num_pubkeys_notified, i64),
                 ("accounts_time", accounts_time.as_us() as i64, i64),
+                ("num_logs_subscriptions", logs.len(), i64),
+                ("num_logs_notified", num_logs_notified, i64),
+                ("logs_time", logs_time.as_us() as i64, i64),
                 ("num_program_subscriptions", programs.len(), i64),
                 ("num_programs_notified", num_programs_notified, i64),
                 ("programs_time", programs_time.as_us() as i64, i64),

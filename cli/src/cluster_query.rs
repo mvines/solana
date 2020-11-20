@@ -7,7 +7,10 @@ use chrono::{Local, TimeZone};
 use clap::{value_t, value_t_or_exit, App, AppSettings, Arg, ArgMatches, SubCommand};
 use console::{style, Emoji};
 use solana_clap_utils::{
-    commitment::commitment_arg, input_parsers::*, input_validators::*, keypair::DefaultSigner,
+    commitment::{commitment_arg, commitment_arg_with_default},
+    input_parsers::*,
+    input_validators::*,
+    keypair::DefaultSigner,
 };
 use solana_cli_output::{
     display::{
@@ -232,6 +235,18 @@ impl ClusterQuerySubCommands for App<'_, '_> {
         .subcommand(
             SubCommand::with_name("live-slots")
                 .about("Show information about the current slot progression"),
+        )
+        .subcommand(
+            SubCommand::with_name("logs")
+                .about("Stream transaction logs")
+                .arg(
+                    pubkey!(Arg::with_name("address")
+                        .index(1)
+                        .value_name("ADDRESS")
+                        .required(true),
+                        "Account address to monitor"),
+                )
+                .arg(commitment_arg_with_default("singleGossip")),
         )
         .subcommand(
             SubCommand::with_name("block-production")
@@ -1161,24 +1176,62 @@ pub fn process_ping(
     Ok("".to_string())
 }
 
-pub fn process_live_slots(url: &str) -> ProcessResult {
-    let exit = Arc::new(AtomicBool::new(false));
+pub fn parse_logs(
+    matches: &ArgMatches<'_>,
+    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+) -> Result<CliCommandInfo, CliError> {
+    let address = pubkey_of_signer(matches, "address", wallet_manager)?.unwrap();
 
-    // Disable Ctrl+C handler as sometimes the PubsubClient shutdown can stall.  Also it doesn't
-    // really matter that the shutdown is clean because the process is terminating.
-    /*
-    let exit_clone = exit.clone();
-    ctrlc::set_handler(move || {
-        exit_clone.store(true, Ordering::Relaxed);
-    })?;
-    */
+    Ok(CliCommandInfo {
+        command: CliCommand::Logs { address },
+        signers: vec![],
+    })
+}
+
+pub fn process_logs(config: &CliConfig, address: Pubkey) -> ProcessResult {
+    println!(
+        "Streaming transaction logs affecting {}. {:?} commitment",
+        address, config.commitment.commitment
+    );
+    let (_client, receiver) = PubsubClient::logs_subscribe_with_commitment(
+        &config.websocket_url,
+        &[address],
+        config.commitment,
+    )?;
+
+    loop {
+        match receiver.recv() {
+            Ok(logs) => {
+                println!("Transaction executed in slot {}:", logs.context.slot);
+                println!("  Signature: {}", logs.value.signature);
+                println!(
+                    "  Status: {}",
+                    logs.value
+                        .err
+                        .map(|err| err.to_string())
+                        .unwrap_or_else(|| "Ok".to_string())
+                );
+                println!("  Log Messages:");
+                for log in logs.value.logs {
+                    println!("    {}", log);
+                }
+            }
+            Err(err) => {
+                return Ok(format!("Disconnected: {}", err));
+            }
+        }
+    }
+}
+
+pub fn process_live_slots(config: &CliConfig) -> ProcessResult {
+    let exit = Arc::new(AtomicBool::new(false));
 
     let mut current: Option<SlotInfo> = None;
     let mut message = "".to_string();
 
     let slot_progress = new_spinner_progress_bar();
     slot_progress.set_message("Connecting...");
-    let (mut client, receiver) = PubsubClient::slot_subscribe(url)?;
+    let (mut client, receiver) = PubsubClient::slot_subscribe(&config.websocket_url)?;
     slot_progress.set_message("Connected.");
 
     let spacer = "|";

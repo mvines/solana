@@ -71,6 +71,13 @@ pub struct RpcProgramAccountsConfig {
     pub account_config: RpcAccountInfoConfig,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionLogsConfig {
+    #[serde(flatten)]
+    pub commitment: Option<CommitmentConfig>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RpcTokenAccountsFilter {

@@ -6,8 +6,13 @@ use jsonrpc_derive::rpc;
 use jsonrpc_pubsub::{typed::Subscriber, Session, SubscriptionId};
 use solana_account_decoder::UiAccount;
 use solana_client::{
-    rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSignatureSubscribeConfig},
-    rpc_response::{Response as RpcResponse, RpcKeyedAccount, RpcSignatureResult, SlotInfo},
+    rpc_config::{
+        RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSignatureSubscribeConfig,
+        RpcTransactionLogsConfig,
+    },
+    rpc_response::{
+        Response as RpcResponse, RpcKeyedAccount, RpcLogsResult, RpcSignatureResult, SlotInfo,
+    },
 };
 #[cfg(test)]
 use solana_runtime::bank_forks::BankForks;
@@ -74,6 +79,24 @@ pub trait RpcSolPubSub {
     )]
     fn program_unsubscribe(&self, meta: Option<Self::Metadata>, id: SubscriptionId)
         -> Result<bool>;
+
+    // Get logs for all transactions that reference the specified address
+    #[pubsub(subscription = "logsNotification", subscribe, name = "logsSubscribe")]
+    fn logs_subscribe(
+        &self,
+        meta: Self::Metadata,
+        subscriber: Subscriber<RpcResponse<RpcLogsResult>>,
+        addresses_str: Vec<String>,
+        config: Option<RpcTransactionLogsConfig>,
+    );
+
+    // Unsubscribe from logs notification subscription.
+    #[pubsub(
+        subscription = "logsNotification",
+        unsubscribe,
+        name = "logsUnsubscribe"
+    )]
+    fn logs_unsubscribe(&self, meta: Option<Self::Metadata>, id: SubscriptionId) -> Result<bool>;
 
     // Get notification when signature is verified
     // Accepts signature parameter as base-58 encoded string
@@ -231,6 +254,55 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
     ) -> Result<bool> {
         info!("program_unsubscribe: id={:?}", id);
         if self.subscriptions.remove_program_subscription(&id) {
+            Ok(true)
+        } else {
+            Err(Error {
+                code: ErrorCode::InvalidParams,
+                message: "Invalid Request: Subscription id does not exist".into(),
+                data: None,
+            })
+        }
+    }
+
+    fn logs_subscribe(
+        &self,
+        _meta: Self::Metadata,
+        subscriber: Subscriber<RpcResponse<RpcLogsResult>>,
+        addresses_str: Vec<String>,
+        config: Option<RpcTransactionLogsConfig>,
+    ) {
+        info!("logs_subscribe");
+
+        // Room is reserved in the API to support multiple or no addresses, but for now the
+        // implementation only supports one address
+        if addresses_str.len() != 1 {
+            subscriber
+                .reject(Error {
+                    code: ErrorCode::InvalidParams,
+                    message: "Invalid Request: Only 1 address supported".into(),
+                    data: None,
+                })
+                .unwrap();
+            return;
+        }
+
+        match param::<Pubkey>(&addresses_str[0], "address") {
+            Ok(address) => {
+                let id = self.uid.fetch_add(1, atomic::Ordering::Relaxed);
+                let sub_id = SubscriptionId::Number(id as u64);
+                self.subscriptions
+                    .add_logs_subscription(address, config, sub_id, subscriber)
+            }
+            Err(e) => {
+                subscriber.reject(e).unwrap();
+                return;
+            }
+        }
+    }
+
+    fn logs_unsubscribe(&self, _meta: Option<Self::Metadata>, id: SubscriptionId) -> Result<bool> {
+        info!("logs_unsubscribe: id={:?}", id);
+        if self.subscriptions.remove_logs_subscription(&id) {
             Ok(true)
         } else {
             Err(Error {
