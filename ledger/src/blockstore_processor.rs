@@ -195,6 +195,7 @@ fn process_entries_with_callback(
     // accumulator for entries that can be processed in parallel
     let mut batches = vec![];
     let mut tick_hashes = vec![];
+    error!("entries.len: {}", entries.len());
     for entry in entries {
         if entry.is_tick() {
             // If it's a tick, save it for later
@@ -269,6 +270,7 @@ fn process_entries_with_callback(
             }
         }
     }
+    error!("execute_batches: len={}", batches.len());
     execute_batches(
         bank,
         &batches,
@@ -626,7 +628,7 @@ pub fn confirm_slot(
 
     let num_entries = entries.len();
     let num_txs = entries.iter().map(|e| e.transactions.len()).sum::<usize>();
-    trace!(
+    error!(
         "Fetched entries for slot {}, num_entries: {}, num_shreds: {}, num_txs: {}, slot_full: {}",
         slot,
         num_entries,
