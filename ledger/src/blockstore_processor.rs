@@ -769,7 +769,7 @@ fn process_next_slots(
                     .unwrap(),
                 *next_slot,
             ));
-            trace!(
+            info!(
                 "New bank for slot {}, parent slot is {}. {} bytes allocated",
                 next_slot,
                 bank.slot(),
@@ -823,7 +823,7 @@ fn load_frozen_forks(
     while !pending_slots.is_empty() {
         let (meta, bank, last_entry_hash) = pending_slots.pop().unwrap();
         let slot = bank.slot();
-        if last_status_report.elapsed() > Duration::from_secs(2) {
+        //if last_status_report.elapsed() > Duration::from_secs(2) {
             let secs = last_status_report.elapsed().as_secs() as f32;
             last_status_report = Instant::now();
             info!(
@@ -836,7 +836,7 @@ fn load_frozen_forks(
             );
             slots_elapsed = 0;
             txs = 0;
-        }
+        //}
 
         let allocated = thread_mem_usage::Allocatedp::default();
         let initial_allocation = allocated.get();
