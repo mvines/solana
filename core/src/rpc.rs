@@ -108,6 +108,7 @@ pub struct JsonRpcConfig {
     pub health_check_slot_distance: u64,
     pub enable_bigtable_ledger_storage: bool,
     pub enable_bigtable_ledger_upload: bool,
+    pub max_multiple_accounts: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -236,7 +237,7 @@ impl JsonRpcRequestProcessor {
         let cluster_info = Arc::new(ClusterInfo::default());
         let tpu_address = cluster_info.my_contact_info().tpu;
         let (sender, receiver) = channel();
-        SendTransactionService::new(tpu_address, &bank_forks, None, receiver);
+        SendTransactionService::new(tpu_address, &bank_forks, None, receiver, 1000, 1);
 
         Self {
             config: JsonRpcConfig::default(),
@@ -346,13 +347,12 @@ impl JsonRpcRequestProcessor {
         let bank = self.bank(None);
         let epoch = bank.epoch();
         let inflation = bank.inflation();
-        let year =
-            (bank.epoch_schedule().get_last_slot_in_epoch(epoch)) as f64 / bank.slots_per_year();
+        let slot_in_year = bank.slot_in_year_for_inflation();
 
         RpcInflationRate {
-            total: inflation.total(year),
-            validator: inflation.validator(year),
-            foundation: inflation.foundation(year),
+            total: inflation.total(slot_in_year),
+            validator: inflation.validator(slot_in_year),
+            foundation: inflation.foundation(slot_in_year),
             epoch,
         }
     }
@@ -601,7 +601,7 @@ impl JsonRpcRequestProcessor {
         }
     }
 
-    fn check_blockstore_max_root<T>(
+    fn check_blockstore_root<T>(
         &self,
         result: &std::result::Result<T, BlockstoreError>,
         slot: Slot,
@@ -612,13 +612,16 @@ impl JsonRpcRequestProcessor {
         if result.is_err() {
             let err = result.as_ref().unwrap_err();
             debug!(
-                "check_blockstore_max_root, slot: {:?}, max root: {:?}, err: {:?}",
+                "check_blockstore_root, slot: {:?}, max root: {:?}, err: {:?}",
                 slot,
                 self.blockstore.max_root(),
                 err
             );
             if slot >= self.blockstore.max_root() {
                 return Err(RpcCustomError::BlockNotAvailable { slot }.into());
+            }
+            if self.blockstore.is_skipped(slot) {
+                return Err(RpcCustomError::SlotSkipped { slot }.into());
             }
         }
         Ok(())
@@ -662,7 +665,7 @@ impl JsonRpcRequestProcessor {
                     .highest_confirmed_root()
         {
             let result = self.blockstore.get_confirmed_block(slot);
-            self.check_blockstore_max_root(&result, slot)?;
+            self.check_blockstore_root(&result, slot)?;
             if result.is_err() {
                 if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
                     return Ok(self
@@ -768,8 +771,8 @@ impl JsonRpcRequestProcessor {
                 .highest_confirmed_root()
         {
             let result = self.blockstore.get_block_time(slot);
-            self.check_blockstore_max_root(&result, slot)?;
-            if result.is_err() {
+            self.check_blockstore_root(&result, slot)?;
+            if result.is_err() || matches!(result, Ok(None)) {
                 if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
                     return Ok(self
                         .runtime_handle
@@ -1923,10 +1926,15 @@ impl RpcSol for RpcSolImpl {
             "get_multiple_accounts rpc request received: {:?}",
             pubkey_strs.len()
         );
-        if pubkey_strs.len() > MAX_MULTIPLE_ACCOUNTS {
+
+        let max_multiple_accounts = meta
+            .config
+            .max_multiple_accounts
+            .unwrap_or(MAX_MULTIPLE_ACCOUNTS);
+        if pubkey_strs.len() > max_multiple_accounts {
             return Err(Error::invalid_params(format!(
                 "Too many inputs provided; max {}",
-                MAX_MULTIPLE_ACCOUNTS
+                max_multiple_accounts
             )));
         }
         let mut pubkeys: Vec<Pubkey> = vec![];
@@ -2314,8 +2322,13 @@ impl RpcSol for RpcSolImpl {
         let config = config.unwrap_or_default();
         let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Base58);
         let (wire_transaction, transaction) = deserialize_transaction(data, encoding)?;
-        let bank = &*meta.bank(None);
-        let last_valid_slot = bank
+
+        let preflight_commitment = config
+            .preflight_commitment
+            .map(|commitment| CommitmentConfig { commitment });
+        let preflight_bank = &*meta.bank(preflight_commitment);
+
+        let last_valid_slot = preflight_bank
             .get_blockhash_last_valid_slot(&transaction.message.recent_blockhash)
             .unwrap_or(0);
 
@@ -2327,11 +2340,6 @@ impl RpcSol for RpcSolImpl {
             if meta.health.check() != RpcHealthStatus::Ok {
                 return Err(RpcCustomError::RpcNodeUnhealthy.into());
             }
-
-            let preflight_commitment = config
-                .preflight_commitment
-                .map(|commitment| CommitmentConfig { commitment });
-            let preflight_bank = &*meta.bank(preflight_commitment);
             if let (Err(err), logs) = preflight_bank.simulate_transaction(transaction.clone()) {
                 return Err(RpcCustomError::SendTransactionPreflightFailure {
                     message: format!("Transaction simulation failed: {}", err),
@@ -2727,7 +2735,9 @@ pub mod tests {
         blockstore_processor::fill_blockstore_slot_with_ticks,
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
     };
-    use solana_runtime::commitment::BlockCommitment;
+    use solana_runtime::{
+        accounts_background_service::ABSRequestSender, commitment::BlockCommitment,
+    };
     use solana_sdk::{
         clock::MAX_RECENT_BLOCKHASHES,
         fee_calculator::DEFAULT_BURN_PERCENT,
@@ -2828,7 +2838,10 @@ pub mod tests {
             bank_forks.write().unwrap().insert(new_bank);
 
             for root in roots.iter() {
-                bank_forks.write().unwrap().set_root(*root, &None, Some(0));
+                bank_forks
+                    .write()
+                    .unwrap()
+                    .set_root(*root, &ABSRequestSender::default(), Some(0));
                 let mut stakes = HashMap::new();
                 stakes.insert(leader_vote_keypair.pubkey(), (1, Account::default()));
                 let block_time = bank_forks
@@ -2893,7 +2906,7 @@ pub mod tests {
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
-        SendTransactionService::new(tpu_address, &bank_forks, None, receiver);
+        SendTransactionService::new(tpu_address, &bank_forks, None, receiver, 1000, 1);
 
         cluster_info.insert_info(ContactInfo::new_with_pubkey_socketaddr(
             &leader_pubkey,
@@ -3301,12 +3314,11 @@ pub mod tests {
         };
         let inflation = bank.inflation();
         let epoch = bank.epoch();
-        let year =
-            (bank.epoch_schedule().get_last_slot_in_epoch(epoch)) as f64 / bank.slots_per_year();
+        let slot_in_year = bank.slot_in_year_for_inflation();
         let expected_inflation_rate = RpcInflationRate {
-            total: inflation.total(year),
-            validator: inflation.validator(year),
-            foundation: inflation.foundation(year),
+            total: inflation.total(slot_in_year),
+            validator: inflation.validator(slot_in_year),
+            foundation: inflation.foundation(slot_in_year),
             epoch,
         };
         assert_eq!(inflation_rate, expected_inflation_rate);
@@ -4294,7 +4306,7 @@ pub mod tests {
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
-        SendTransactionService::new(tpu_address, &bank_forks, None, receiver);
+        SendTransactionService::new(tpu_address, &bank_forks, None, receiver, 1000, 1);
 
         let mut bad_transaction = system_transaction::transfer(
             &mint_keypair,
@@ -4490,7 +4502,7 @@ pub mod tests {
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
-        SendTransactionService::new(tpu_address, &bank_forks, None, receiver);
+        SendTransactionService::new(tpu_address, &bank_forks, None, receiver, 1000, 1);
         assert_eq!(request_processor.validator_exit(), false);
         assert_eq!(exit.load(Ordering::Relaxed), false);
     }
@@ -4502,8 +4514,10 @@ pub mod tests {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
         let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
-        let mut config = JsonRpcConfig::default();
-        config.enable_validator_exit = true;
+        let config = JsonRpcConfig {
+            enable_validator_exit: true,
+            ..JsonRpcConfig::default()
+        };
         let bank_forks = new_bank_forks().0;
         let cluster_info = Arc::new(ClusterInfo::default());
         let tpu_address = cluster_info.my_contact_info().tpu;
@@ -4520,7 +4534,7 @@ pub mod tests {
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
-        SendTransactionService::new(tpu_address, &bank_forks, None, receiver);
+        SendTransactionService::new(tpu_address, &bank_forks, None, receiver, 1000, 1);
         assert_eq!(request_processor.validator_exit(), true);
         assert_eq!(exit.load(Ordering::Relaxed), true);
     }
@@ -4592,8 +4606,10 @@ pub mod tests {
             CommitmentSlots::new_from_slot(bank_forks.read().unwrap().highest_slot()),
         )));
 
-        let mut config = JsonRpcConfig::default();
-        config.enable_validator_exit = true;
+        let config = JsonRpcConfig {
+            enable_validator_exit: true,
+            ..JsonRpcConfig::default()
+        };
         let cluster_info = Arc::new(ClusterInfo::default());
         let tpu_address = cluster_info.my_contact_info().tpu;
         let (request_processor, receiver) = JsonRpcRequestProcessor::new(
@@ -4609,7 +4625,7 @@ pub mod tests {
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
-        SendTransactionService::new(tpu_address, &bank_forks, None, receiver);
+        SendTransactionService::new(tpu_address, &bank_forks, None, receiver, 1000, 1);
         assert_eq!(
             request_processor.get_block_commitment(0),
             RpcBlockCommitment {

@@ -1,15 +1,12 @@
 use crate::{
-    checks::*, cluster_query::*, feature::*, inflation::*, nonce::*, send_tpu::*, spend_utils::*,
-    stake::*, validator_info::*, vote::*,
+    cluster_query::*, feature::*, inflation::*, nonce::*, program::*, spend_utils::*, stake::*,
+    validator_info::*, vote::*,
 };
-use bincode::serialize;
-use bip39::{Language, Mnemonic, MnemonicType, Seed};
 use clap::{value_t_or_exit, App, AppSettings, Arg, ArgMatches, SubCommand};
 use log::*;
 use num_traits::FromPrimitive;
-use serde_json::{self, json, Value};
+use serde_json::{self, Value};
 use solana_account_decoder::{UiAccount, UiAccountEncoding};
-use solana_bpf_loader_program::{bpf_verifier, BPFError, ThisInstructionMeter};
 use solana_clap_utils::{
     self,
     commitment::commitment_arg_with_default,
@@ -21,9 +18,7 @@ use solana_clap_utils::{
     offline::*,
 };
 use solana_cli_output::{
-    display::{
-        build_balance_message, new_spinner_progress_bar, println_name_value, println_transaction,
-    },
+    display::{build_balance_message, println_name_value, println_transaction},
     return_signers, CliAccount, CliSignature, OutputFormat,
 };
 use solana_client::{
@@ -32,28 +27,22 @@ use solana_client::{
     nonce_utils,
     rpc_client::RpcClient,
     rpc_config::{RpcLargestAccountsFilter, RpcSendTransactionConfig, RpcTransactionLogsFilter},
-    rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
-    rpc_response::{RpcKeyedAccount, RpcLeaderSchedule},
+    rpc_response::RpcKeyedAccount,
 };
 #[cfg(not(test))]
 use solana_faucet::faucet::request_airdrop_transaction;
 #[cfg(test)]
 use solana_faucet::faucet_mock::request_airdrop_transaction;
-use solana_rbpf::vm::{Config, Executable};
 use solana_remote_wallet::remote_wallet::RemoteWalletManager;
 use solana_sdk::{
-    bpf_loader, bpf_loader_deprecated,
     clock::{Epoch, Slot},
     commitment_config::CommitmentConfig,
     decode_error::DecodeError,
     hash::Hash,
-    instruction::{Instruction, InstructionError},
-    loader_instruction,
+    instruction::InstructionError,
     message::Message,
-    native_token::Sol,
     pubkey::{Pubkey, MAX_SEED_LEN},
-    signature::{keypair_from_seed, Keypair, Signature, Signer, SignerError},
-    signers::Signers,
+    signature::{Signature, Signer, SignerError},
     system_instruction::{self, SystemError},
     system_program,
     transaction::{Transaction, TransactionError},
@@ -65,13 +54,12 @@ use solana_stake_program::{
 use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding};
 use solana_vote_program::vote_state::VoteAuthorize;
 use std::{
-    cmp::min,
     collections::HashMap,
     error,
     fmt::Write as FmtWrite,
     fs::File,
-    io::{Read, Write},
-    net::{IpAddr, SocketAddr, UdpSocket},
+    io::Write,
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
     thread::sleep,
@@ -80,7 +68,6 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
-const DATA_CHUNK_SIZE: usize = 229; // Keep program chunks under PACKET_DATA_SIZE
 pub const DEFAULT_RPC_TIMEOUT_SECONDS: &str = "30";
 
 #[derive(Debug, PartialEq)]
@@ -128,6 +115,8 @@ pub enum CliCommand {
         interval: Duration,
         count: Option<u64>,
         timeout: Duration,
+        blockhash: Option<Hash>,
+        print_timestamp: bool,
     },
     ShowBlockProduction {
         epoch: Option<Epoch>,
@@ -189,6 +178,7 @@ pub enum CliCommand {
         use_deprecated_loader: bool,
         allow_excessive_balance: bool,
     },
+    Program(ProgramCliCommand),
     // Stake Commands
     CreateStakeAccount {
         stake_account: SignerIndex,
@@ -442,7 +432,7 @@ impl CliConfig<'_> {
     ) -> (SettingType, String) {
         settings
             .into_iter()
-            .find(|(_, value)| value != "")
+            .find(|(_, value)| !value.is_empty())
             .expect("no nonempty setting")
     }
 
@@ -500,13 +490,15 @@ impl CliConfig<'_> {
     }
 
     pub fn recent_for_tests() -> Self {
-        let mut config = Self::default();
-        config.commitment = CommitmentConfig::recent();
-        config.send_transaction_config = RpcSendTransactionConfig {
-            skip_preflight: true,
-            ..RpcSendTransactionConfig::default()
-        };
-        config
+        Self {
+            commitment: CommitmentConfig::recent(),
+            send_transaction_config: RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: Some(CommitmentConfig::recent().commitment),
+                ..RpcSendTransactionConfig::default()
+            },
+            ..Self::default()
+        }
     }
 }
 
@@ -630,6 +622,9 @@ pub fn parse_command(
                 },
                 signers,
             })
+        }
+        ("program", Some(matches)) => {
+            parse_program_subcommand(matches, default_signer, wallet_manager)
         }
         ("wait-for-max-stake", Some(matches)) => {
             let max_stake_percent = value_t_or_exit!(matches, "max_percent", f32);
@@ -993,6 +988,7 @@ fn process_confirm(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn process_decode_transaction(transaction: &Transaction) -> ProcessResult {
     println_transaction(transaction, &None, "");
     Ok("".to_string())
@@ -1036,398 +1032,6 @@ fn process_show_account(
     }
 
     Ok(account_string)
-}
-
-fn send_and_confirm_transactions_with_spinner<T: Signers>(
-    rpc_client: &RpcClient,
-    mut transactions: Vec<Transaction>,
-    signer_keys: &T,
-    commitment: CommitmentConfig,
-    mut last_valid_slot: Slot,
-) -> Result<(), Box<dyn error::Error>> {
-    let progress_bar = new_spinner_progress_bar();
-    let mut send_retries = 5;
-    let mut leader_schedule: Option<RpcLeaderSchedule> = None;
-    let mut leader_schedule_epoch = 0;
-    let send_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-    let cluster_nodes = rpc_client.get_cluster_nodes().ok();
-
-    loop {
-        let mut status_retries = 15;
-
-        progress_bar.set_message("Finding leader node...");
-        let epoch_info = rpc_client.get_epoch_info_with_commitment(commitment)?;
-        if epoch_info.epoch > leader_schedule_epoch || leader_schedule.is_none() {
-            leader_schedule = rpc_client
-                .get_leader_schedule_with_commitment(Some(epoch_info.absolute_slot), commitment)?;
-            leader_schedule_epoch = epoch_info.epoch;
-        }
-        let tpu_address = get_leader_tpu(
-            min(epoch_info.slot_index + 1, epoch_info.slots_in_epoch),
-            leader_schedule.as_ref(),
-            cluster_nodes.as_ref(),
-        );
-
-        // Send all transactions
-        let mut pending_transactions = HashMap::new();
-        let num_transactions = transactions.len();
-        for transaction in transactions {
-            if let Some(tpu_address) = tpu_address {
-                let wire_transaction =
-                    serialize(&transaction).expect("serialization should succeed");
-                send_transaction_tpu(&send_socket, &tpu_address, &wire_transaction);
-            } else {
-                let _result = rpc_client
-                    .send_transaction_with_config(
-                        &transaction,
-                        RpcSendTransactionConfig {
-                            preflight_commitment: Some(commitment.commitment),
-                            ..RpcSendTransactionConfig::default()
-                        },
-                    )
-                    .ok();
-            }
-            pending_transactions.insert(transaction.signatures[0], transaction);
-
-            progress_bar.set_message(&format!(
-                "[{}/{}] Total Transactions sent",
-                pending_transactions.len(),
-                num_transactions
-            ));
-        }
-
-        // Collect statuses for all the transactions, drop those that are confirmed
-        while status_retries > 0 {
-            status_retries -= 1;
-
-            progress_bar.set_message(&format!(
-                "[{}/{}] Transactions confirmed",
-                num_transactions - pending_transactions.len(),
-                num_transactions
-            ));
-
-            let mut statuses = vec![];
-            let pending_signatures = pending_transactions.keys().cloned().collect::<Vec<_>>();
-            for pending_signatures_chunk in
-                pending_signatures.chunks(MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS - 1)
-            {
-                statuses.extend(
-                    rpc_client
-                        .get_signature_statuses_with_history(pending_signatures_chunk)?
-                        .value
-                        .into_iter(),
-                );
-            }
-            assert_eq!(statuses.len(), pending_signatures.len());
-
-            for (signature, status) in pending_signatures.into_iter().zip(statuses.into_iter()) {
-                if let Some(status) = status {
-                    if status.confirmations.is_none() || status.confirmations.unwrap() > 1 {
-                        let _ = pending_transactions.remove(&signature);
-                    }
-                }
-                progress_bar.set_message(&format!(
-                    "[{}/{}] Transactions confirmed",
-                    num_transactions - pending_transactions.len(),
-                    num_transactions
-                ));
-            }
-
-            if pending_transactions.is_empty() {
-                return Ok(());
-            }
-
-            let slot = rpc_client.get_slot_with_commitment(commitment)?;
-            if slot > last_valid_slot {
-                break;
-            }
-
-            if cfg!(not(test)) {
-                // Retry twice a second
-                sleep(Duration::from_millis(500));
-            }
-        }
-
-        if send_retries == 0 {
-            return Err("Transactions failed".into());
-        }
-        send_retries -= 1;
-
-        // Re-sign any failed transactions with a new blockhash and retry
-        let (blockhash, _fee_calculator, new_last_valid_slot) = rpc_client
-            .get_recent_blockhash_with_commitment(commitment)?
-            .value;
-        last_valid_slot = new_last_valid_slot;
-        transactions = vec![];
-        for (_, mut transaction) in pending_transactions.into_iter() {
-            transaction.try_sign(signer_keys, blockhash)?;
-            transactions.push(transaction);
-        }
-    }
-}
-
-fn process_deploy(
-    rpc_client: &RpcClient,
-    config: &CliConfig,
-    program_location: &str,
-    address: Option<SignerIndex>,
-    use_deprecated_loader: bool,
-    allow_excessive_balance: bool,
-) -> ProcessResult {
-    const WORDS: usize = 12;
-    // Create ephemeral keypair to use for program address, if not provided
-    let mnemonic = Mnemonic::new(MnemonicType::for_word_count(WORDS)?, Language::English);
-    let seed = Seed::new(&mnemonic, "");
-    let new_keypair = keypair_from_seed(seed.as_bytes())?;
-
-    let result = do_process_deploy(
-        rpc_client,
-        config,
-        program_location,
-        address,
-        use_deprecated_loader,
-        allow_excessive_balance,
-        new_keypair,
-    );
-
-    if result.is_err() && address.is_none() {
-        let phrase: &str = mnemonic.phrase();
-        let divider = String::from_utf8(vec![b'='; phrase.len()]).unwrap();
-        eprintln!(
-            "{}\nTo reuse this address, recover the ephemeral keypair file with",
-            divider
-        );
-        eprintln!(
-            "`solana-keygen recover` and the following {}-word seed phrase,",
-            WORDS
-        );
-        eprintln!(
-            "then pass it as the [PROGRAM_ADDRESS_SIGNER] argument to `solana deploy ...`\n{}\n{}\n{}",
-            divider, phrase, divider
-        );
-    }
-    result
-}
-
-fn do_process_deploy(
-    rpc_client: &RpcClient,
-    config: &CliConfig,
-    program_location: &str,
-    address: Option<SignerIndex>,
-    use_deprecated_loader: bool,
-    allow_excessive_balance: bool,
-    new_keypair: Keypair,
-) -> ProcessResult {
-    let program_id = if let Some(i) = address {
-        config.signers[i]
-    } else {
-        &new_keypair
-    };
-    let mut file = File::open(program_location).map_err(|err| {
-        CliError::DynamicProgramError(format!("Unable to open program file: {}", err))
-    })?;
-    let mut program_data = Vec::new();
-    file.read_to_end(&mut program_data).map_err(|err| {
-        CliError::DynamicProgramError(format!("Unable to read program file: {}", err))
-    })?;
-
-    Executable::<BPFError, ThisInstructionMeter>::from_elf(
-        &program_data,
-        Some(|x| bpf_verifier::check(x, false)),
-        Config::default(),
-    )
-    .map_err(|err| CliError::DynamicProgramError(format!("ELF error: {}", err)))?;
-
-    let loader_id = if use_deprecated_loader {
-        bpf_loader_deprecated::id()
-    } else {
-        bpf_loader::id()
-    };
-
-    let minimum_balance = rpc_client.get_minimum_balance_for_rent_exemption(program_data.len())?;
-    let signers = [config.signers[0], program_id];
-
-    // Check program account to see if partial initialization has occurred
-    let (initial_instructions, balance_needed) = if let Some(account) = rpc_client
-        .get_account_with_commitment(&program_id.pubkey(), config.commitment)?
-        .value
-    {
-        let mut instructions: Vec<Instruction> = vec![];
-        let mut balance_needed = 0;
-        if account.executable {
-            return Err(CliError::DynamicProgramError(
-                "Program account is already executable".to_string(),
-            )
-            .into());
-        }
-        if account.owner != loader_id && !system_program::check_id(&account.owner) {
-            return Err(CliError::DynamicProgramError(
-                "Program account is already owned by another account".to_string(),
-            )
-            .into());
-        }
-
-        if account.data.is_empty() && system_program::check_id(&account.owner) {
-            instructions.push(system_instruction::allocate(
-                &program_id.pubkey(),
-                program_data.len() as u64,
-            ));
-            if account.owner != loader_id {
-                instructions.push(system_instruction::assign(&program_id.pubkey(), &loader_id));
-            }
-        }
-        if account.lamports < minimum_balance {
-            let balance = minimum_balance - account.lamports;
-            instructions.push(system_instruction::transfer(
-                &config.signers[0].pubkey(),
-                &program_id.pubkey(),
-                balance,
-            ));
-            balance_needed = balance;
-        } else if account.lamports > minimum_balance
-            && system_program::check_id(&account.owner)
-            && !allow_excessive_balance
-        {
-            return Err(CliError::DynamicProgramError(format!(
-                "Program account has a balance: {:?}; it may already be in use",
-                Sol(account.lamports)
-            ))
-            .into());
-        }
-        (instructions, balance_needed)
-    } else {
-        (
-            vec![system_instruction::create_account(
-                &config.signers[0].pubkey(),
-                &program_id.pubkey(),
-                minimum_balance,
-                program_data.len() as u64,
-                &loader_id,
-            )],
-            minimum_balance,
-        )
-    };
-    let initial_message = if !initial_instructions.is_empty() {
-        Some(Message::new(
-            &initial_instructions,
-            Some(&config.signers[0].pubkey()),
-        ))
-    } else {
-        None
-    };
-
-    // Build transactions to calculate fees
-    let mut messages: Vec<&Message> = Vec::new();
-
-    if let Some(message) = &initial_message {
-        messages.push(message);
-    }
-
-    let mut write_messages = vec![];
-    for (chunk, i) in program_data.chunks(DATA_CHUNK_SIZE).zip(0..) {
-        let instruction = loader_instruction::write(
-            &program_id.pubkey(),
-            &loader_id,
-            (i * DATA_CHUNK_SIZE) as u32,
-            chunk.to_vec(),
-        );
-        let message = Message::new(&[instruction], Some(&signers[0].pubkey()));
-        write_messages.push(message);
-    }
-    let mut write_message_refs = vec![];
-    for message in write_messages.iter() {
-        write_message_refs.push(message);
-    }
-    messages.append(&mut write_message_refs);
-
-    let instruction = loader_instruction::finalize(&program_id.pubkey(), &loader_id);
-    let finalize_message = Message::new(&[instruction], Some(&signers[0].pubkey()));
-    messages.push(&finalize_message);
-
-    let (blockhash, fee_calculator, _) = rpc_client
-        .get_recent_blockhash_with_commitment(config.commitment)?
-        .value;
-
-    check_account_for_spend_multiple_fees_with_commitment(
-        rpc_client,
-        &config.signers[0].pubkey(),
-        balance_needed,
-        &fee_calculator,
-        &messages,
-        config.commitment,
-    )?;
-
-    if let Some(message) = initial_message {
-        trace!("Creating or modifying program account");
-        let num_required_signatures = message.header.num_required_signatures;
-
-        let mut initial_transaction = Transaction::new_unsigned(message);
-        // Most of the initial_transaction combinations require both the fee-payer and new program
-        // account to sign the transaction. One (transfer) only requires the fee-payer signature.
-        // This check is to ensure signing does not fail on a KeypairPubkeyMismatch error from an
-        // extraneous signature.
-        if num_required_signatures == 2 {
-            initial_transaction.try_sign(&signers, blockhash)?;
-        } else {
-            initial_transaction.try_sign(&[signers[0]], blockhash)?;
-        }
-        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &initial_transaction,
-            config.commitment,
-            config.send_transaction_config,
-        );
-        log_instruction_custom_error::<SystemError>(result, &config).map_err(|err| {
-            CliError::DynamicProgramError(format!("Program account allocation failed: {}", err))
-        })?;
-    }
-
-    let (blockhash, _, last_valid_slot) = rpc_client
-        .get_recent_blockhash_with_commitment(config.commitment)?
-        .value;
-
-    let mut write_transactions = vec![];
-    for message in write_messages.into_iter() {
-        let mut tx = Transaction::new_unsigned(message);
-        tx.try_sign(&signers, blockhash)?;
-        write_transactions.push(tx);
-    }
-
-    trace!("Writing program data");
-    send_and_confirm_transactions_with_spinner(
-        &rpc_client,
-        write_transactions,
-        &signers,
-        config.commitment,
-        last_valid_slot,
-    )
-    .map_err(|err| {
-        CliError::DynamicProgramError(format!("Data writes to program account failed: {}", err))
-    })?;
-
-    let (blockhash, _, _) = rpc_client
-        .get_recent_blockhash_with_commitment(config.commitment)?
-        .value;
-    let mut finalize_tx = Transaction::new_unsigned(finalize_message);
-    finalize_tx.try_sign(&signers, blockhash)?;
-
-    trace!("Finalizing program account");
-    rpc_client
-        .send_and_confirm_transaction_with_spinner_and_config(
-            &finalize_tx,
-            config.commitment,
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..RpcSendTransactionConfig::default()
-            },
-        )
-        .map_err(|e| {
-            CliError::DynamicProgramError(format!("Finalizing program account failed: {}", e))
-        })?;
-
-    Ok(json!({
-        "programId": format!("{}", program_id.pubkey()),
-    })
-    .to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1570,7 +1174,18 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             interval,
             count,
             timeout,
-        } => process_ping(&rpc_client, config, *lamports, interval, count, timeout),
+            blockhash,
+            print_timestamp,
+        } => process_ping(
+            &rpc_client,
+            config,
+            *lamports,
+            interval,
+            count,
+            timeout,
+            blockhash,
+            *print_timestamp,
+        ),
         CliCommand::ShowBlockProduction { epoch, slot_limit } => {
             process_show_block_production(&rpc_client, config, *epoch, *slot_limit)
         }
@@ -1688,6 +1303,9 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_deprecated_loader,
             *allow_excessive_balance,
         ),
+        CliCommand::Program(program_subcommand) => {
+            process_program_subcommand(&rpc_client, config, program_subcommand)
+        }
 
         // Stake Commands
 
@@ -2173,6 +1791,7 @@ pub fn app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> App<'ab, '
         .feature_subcommands()
         .inflation_subcommands()
         .nonce_subcommands()
+        .program_subcommands()
         .stake_subcommands()
         .subcommand(
             SubCommand::with_name("airdrop")
@@ -2426,7 +2045,7 @@ pub fn app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> App<'ab, '
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use solana_client::{
         blockhash_query,
         mock_sender::SIGNATURE,
@@ -2435,7 +2054,7 @@ mod tests {
     };
     use solana_sdk::{
         pubkey::Pubkey,
-        signature::{keypair_from_seed, read_keypair_file, write_keypair_file, Presigner},
+        signature::{keypair_from_seed, read_keypair_file, write_keypair_file, Keypair, Presigner},
         transaction::TransactionError,
     };
     use std::path::PathBuf;
@@ -2750,9 +2369,11 @@ mod tests {
     #[allow(clippy::cognitive_complexity)]
     fn test_cli_process_command() {
         // Success cases
-        let mut config = CliConfig::default();
-        config.rpc_client = Some(RpcClient::new_mock("succeeds".to_string()));
-        config.json_rpc_url = "http://127.0.0.1:8899".to_string();
+        let mut config = CliConfig {
+            rpc_client: Some(RpcClient::new_mock("succeeds".to_string())),
+            json_rpc_url: "http://127.0.0.1:8899".to_string(),
+            ..CliConfig::default()
+        };
 
         let keypair = Keypair::new();
         let pubkey = keypair.pubkey().to_string();

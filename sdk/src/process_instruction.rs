@@ -61,6 +61,8 @@ pub trait InvokeContext {
     fn record_instruction(&self, instruction: &Instruction);
     /// Get the bank's active feature set
     fn is_feature_active(&self, feature_id: &Pubkey) -> bool;
+    /// Get an account from a pre-account
+    fn get_account(&self, pubkey: &Pubkey) -> Option<Account>;
 }
 
 #[derive(Clone, Copy, Debug, AbiExample)]
@@ -241,6 +243,7 @@ pub trait Executor: Debug + Send + Sync {
         keyed_accounts: &[KeyedAccount],
         instruction_data: &[u8],
         invoke_context: &mut dyn InvokeContext,
+        use_jit: bool,
     ) -> Result<(), InstructionError>;
 }
 
@@ -281,7 +284,7 @@ pub struct MockInvokeContext {
     pub bpf_compute_budget: BpfComputeBudget,
     pub compute_meter: MockComputeMeter,
     pub programs: Vec<(Pubkey, ProcessInstructionWithContext)>,
-    invoke_depth: usize,
+    pub invoke_depth: usize,
 }
 impl Default for MockInvokeContext {
     fn default() -> Self {
@@ -338,5 +341,8 @@ impl InvokeContext for MockInvokeContext {
     fn record_instruction(&self, _instruction: &Instruction) {}
     fn is_feature_active(&self, _feature_id: &Pubkey) -> bool {
         true
+    }
+    fn get_account(&self, _pubkey: &Pubkey) -> Option<Account> {
+        None
     }
 }

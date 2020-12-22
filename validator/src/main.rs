@@ -11,7 +11,7 @@ use solana_clap_utils::{
     },
     keypair::SKIP_SEED_PHRASE_VALIDATION_ARG,
 };
-use solana_client::rpc_client::RpcClient;
+use solana_client::{rpc_client::RpcClient, rpc_request::MAX_MULTIPLE_ACCOUNTS};
 use solana_core::ledger_cleanup_service::{
     DEFAULT_MAX_LEDGER_SHREDS, DEFAULT_MIN_MAX_LEDGER_SHREDS,
 };
@@ -21,7 +21,7 @@ use solana_core::{
     gossip_service::GossipService,
     rpc::JsonRpcConfig,
     rpc_pubsub_service::PubSubConfig,
-    validator::{Validator, ValidatorConfig},
+    validator::{is_snapshot_config_invalid, Validator, ValidatorConfig},
 };
 use solana_download_utils::{download_genesis_if_missing, download_snapshot};
 use solana_ledger::blockstore_db::BlockstoreRecoveryMode;
@@ -39,6 +39,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
+use solana_validator::start_logger;
 use std::{
     collections::HashSet,
     env,
@@ -51,15 +52,9 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::{sleep, JoinHandle},
+    thread::sleep,
     time::{Duration, Instant},
 };
-
-fn port_validator(port: String) -> Result<(), String> {
-    port.parse::<u16>()
-        .map(|_| ())
-        .map_err(|e| format!("{:?}", e))
-}
 
 fn port_range_validator(port_range: String) -> Result<(), String> {
     if let Some((start, end)) = solana_net_utils::parse_port_range(&port_range) {
@@ -212,7 +207,9 @@ fn get_rpc_node(
         );
 
         if rpc_peers_blacklisted == rpc_peers_total {
-            retry_reason = if blacklist_timeout.elapsed().as_secs() > 60 {
+            retry_reason = if !blacklisted_rpc_nodes.is_empty()
+                && blacklist_timeout.elapsed().as_secs() > 60
+            {
                 // If all nodes are blacklisted and no additional nodes are discovered after 60 seconds,
                 // remove the blacklist and try them all again
                 blacklisted_rpc_nodes.clear();
@@ -478,73 +475,6 @@ fn download_then_check_genesis_hash(
     };
 
     Ok(genesis_config.hash())
-}
-
-fn is_snapshot_config_invalid(
-    snapshot_interval_slots: u64,
-    accounts_hash_interval_slots: u64,
-) -> bool {
-    snapshot_interval_slots != 0
-        && (snapshot_interval_slots < accounts_hash_interval_slots
-            || snapshot_interval_slots % accounts_hash_interval_slots != 0)
-}
-
-#[cfg(unix)]
-fn redirect_stderr(filename: &str) {
-    use std::{fs::OpenOptions, os::unix::io::AsRawFd};
-    match OpenOptions::new()
-        .write(true)
-        .create(true)
-        .append(true)
-        .open(filename)
-    {
-        Ok(file) => unsafe {
-            libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
-        },
-        Err(err) => eprintln!("Unable to open {}: {}", filename, err),
-    }
-}
-
-fn start_logger(logfile: Option<String>) -> Option<JoinHandle<()>> {
-    let logger_thread = match logfile {
-        None => None,
-        Some(logfile) => {
-            #[cfg(unix)]
-            {
-                let signals = signal_hook::iterator::Signals::new(&[signal_hook::SIGUSR1])
-                    .unwrap_or_else(|err| {
-                        eprintln!("Unable to register SIGUSR1 handler: {:?}", err);
-                        exit(1);
-                    });
-
-                redirect_stderr(&logfile);
-                Some(std::thread::spawn(move || {
-                    for signal in signals.forever() {
-                        info!(
-                            "received SIGUSR1 ({}), reopening log file: {:?}",
-                            signal, logfile
-                        );
-                        redirect_stderr(&logfile);
-                    }
-                }))
-            }
-            #[cfg(not(unix))]
-            {
-                println!("logging to a file is not supported on this platform");
-                ()
-            }
-        }
-    };
-
-    solana_logger::setup_with_default(
-        &[
-            "solana=info,solana_runtime::message_processor=error", /* info logging for all solana modules */
-            "rpc=trace",   /* json_rpc request/response logging */
-        ]
-        .join(","),
-    );
-
-    logger_thread
 }
 
 fn verify_reachable_ports(
@@ -860,6 +790,7 @@ pub fn main() {
     let default_dynamic_port_range =
         &format!("{}-{}", VALIDATOR_PORT_RANGE.0, VALIDATOR_PORT_RANGE.1);
     let default_genesis_archive_unpacked_size = &MAX_GENESIS_ARCHIVE_UNPACKED_SIZE.to_string();
+    let default_rpc_max_multiple_accounts = &MAX_MULTIPLE_ACCOUNTS.to_string();
     let default_rpc_pubsub_max_connections = PubSubConfig::default().max_connections.to_string();
     let default_rpc_pubsub_max_fragment_size =
         PubSubConfig::default().max_fragment_size.to_string();
@@ -867,6 +798,12 @@ pub fn main() {
         PubSubConfig::default().max_in_buffer_capacity.to_string();
     let default_rpc_pubsub_max_out_buffer_capacity =
         PubSubConfig::default().max_out_buffer_capacity.to_string();
+    let default_rpc_send_transaction_retry_ms = ValidatorConfig::default()
+        .send_transaction_retry_ms
+        .to_string();
+    let default_rpc_send_transaction_leader_forward_count = ValidatorConfig::default()
+        .send_transaction_leader_forward_count
+        .to_string();
 
     let matches = App::new(crate_name!()).about(crate_description!())
         .version(solana_version::version!())
@@ -985,8 +922,8 @@ pub fn main() {
                 .long("rpc-port")
                 .value_name("PORT")
                 .takes_value(true)
-                .validator(port_validator)
-                .help("Use this port for JSON RPC, the next port for the RPC websocket, and then third port for the RPC banks API"),
+                .validator(solana_validator::port_validator)
+                .help("Use this port for JSON RPC and the next port for the RPC websocket"),
         )
         .arg(
             Arg::with_name("private_rpc")
@@ -1038,6 +975,15 @@ pub fn main() {
                 .help("Upload new confirmed blocks into a BigTable instance"),
         )
         .arg(
+            Arg::with_name("rpc_max_multiple_accounts")
+                .long("rpc-max-multiple-accounts")
+                .value_name("MAX ACCOUNTS")
+                .takes_value(true)
+                .default_value(default_rpc_max_multiple_accounts)
+                .help("Override the default maximum accounts accepted by \
+                       the getMultipleAccounts JSON RPC method")
+        )
+        .arg(
             Arg::with_name("health_check_slot_distance")
                 .long("health-check-slot-distance")
                 .value_name("SLOT_DISTANCE")
@@ -1058,20 +1004,20 @@ pub fn main() {
                 .help("Enable the JSON RPC 'requestAirdrop' API with this faucet address."),
         )
         .arg(
-            Arg::with_name("signer_addr")
-                .long("vote-signer-address")
-                .value_name("HOST:PORT")
-                .takes_value(true)
-                .hidden(true) // Don't document this argument to discourage its use
-                .validator(solana_net_utils::is_host_port)
-                .help("Rendezvous with the vote signer at this RPC end point"),
-        )
-        .arg(
             Arg::with_name("account_paths")
                 .long("accounts")
                 .value_name("PATHS")
                 .takes_value(true)
+                .multiple(true)
                 .help("Comma separated persistent accounts location"),
+        )
+        .arg(
+            Arg::with_name("account_shrink_path")
+                .long("account-shrink-path")
+                .value_name("PATH")
+                .takes_value(true)
+                .multiple(true)
+                .help("Path to accounts shrink path which can hold a compacted account set."),
         )
         .arg(
             Arg::with_name("gossip_port")
@@ -1203,6 +1149,7 @@ pub fn main() {
                 .long("expected-shred-version")
                 .value_name("VERSION")
                 .takes_value(true)
+                .validator(is_parsable::<u16>)
                 .help("Require the shred version be this value"),
         )
         .arg(
@@ -1348,6 +1295,24 @@ pub fn main() {
                 .help("The maximum size in bytes to which the outgoing websocket buffer can grow."),
         )
         .arg(
+            Arg::with_name("rpc_send_transaction_retry_ms")
+                .long("rpc-send-retry-ms")
+                .value_name("MILLISECS")
+                .takes_value(true)
+                .validator(is_parsable::<u64>)
+                .default_value(&default_rpc_send_transaction_retry_ms)
+                .help("The rate at which transactions sent via rpc service are retried."),
+        )
+        .arg(
+            Arg::with_name("rpc_send_transaction_leader_forward_count")
+                .long("rpc-send-leader-count")
+                .value_name("NUMBER")
+                .takes_value(true)
+                .validator(is_parsable::<u64>)
+                .default_value(&default_rpc_send_transaction_leader_forward_count)
+                .help("The number of upcoming leaders to which to forward transactions sent via rpc service."),
+        )
+        .arg(
             Arg::with_name("halt_on_trusted_validators_accounts_hash_mismatch")
                 .long("halt-on-trusted-validators-accounts-hash-mismatch")
                 .requires("trusted_validators")
@@ -1397,6 +1362,12 @@ pub fn main() {
                 .help(
                     "Mode to recovery the ledger db write ahead log."
                 ),
+        )
+        .arg(
+            Arg::with_name("bpf_jit")
+                .long("bpf-jit")
+                .takes_value(false)
+                .help("Use the just-in-time compiler instead of the interpreter for BPF."),
         )
         .get_matches();
 
@@ -1499,6 +1470,11 @@ pub fn main() {
             faucet_addr: matches.value_of("rpc_faucet_addr").map(|address| {
                 solana_net_utils::parse_host_port(address).expect("failed to parse faucet address")
             }),
+            max_multiple_accounts: Some(value_t_or_exit!(
+                matches,
+                "rpc_max_multiple_accounts",
+                usize
+            )),
             health_check_slot_distance: value_t_or_exit!(
                 matches,
                 "health_check_slot_distance",
@@ -1540,6 +1516,13 @@ pub fn main() {
         poh_verify: !matches.is_present("skip_poh_verify"),
         debug_keys,
         contact_debug_interval,
+        bpf_jit: matches.is_present("bpf_jit"),
+        send_transaction_retry_ms: value_t_or_exit!(matches, "rpc_send_transaction_retry_ms", u64),
+        send_transaction_leader_forward_count: value_t_or_exit!(
+            matches,
+            "rpc_send_transaction_leader_forward_count",
+            u64
+        ),
         ..ValidatorConfig::default()
     };
 
@@ -1555,11 +1538,20 @@ pub fn main() {
         solana_net_utils::parse_port_range(matches.value_of("dynamic_port_range").unwrap())
             .expect("invalid dynamic_port_range");
 
-    let account_paths = if let Some(account_paths) = matches.value_of("account_paths") {
-        account_paths.split(',').map(PathBuf::from).collect()
-    } else {
-        vec![ledger_path.join("accounts")]
-    };
+    let account_paths: Vec<PathBuf> =
+        if let Ok(account_paths) = values_t!(matches, "account_paths", String) {
+            account_paths
+                .join(",")
+                .split(',')
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            vec![ledger_path.join("accounts")]
+        };
+    let account_shrink_paths: Option<Vec<PathBuf>> =
+        values_t!(matches, "account_shrink_path", String)
+            .map(|shrink_paths| shrink_paths.into_iter().map(PathBuf::from).collect())
+            .ok();
 
     // Create and canonicalize account paths to avoid issues with symlink creation
     validator_config.account_paths = account_paths
@@ -1577,6 +1569,26 @@ pub fn main() {
             }
         })
         .collect();
+
+    validator_config.account_shrink_paths = account_shrink_paths.map(|paths| {
+        paths
+            .into_iter()
+            .map(|account_path| {
+                match fs::create_dir_all(&account_path)
+                    .and_then(|_| fs::canonicalize(&account_path))
+                {
+                    Ok(account_path) => account_path,
+                    Err(err) => {
+                        eprintln!(
+                            "Unable to access account path: {:?}, err: {:?}",
+                            account_path, err
+                        );
+                        exit(1);
+                    }
+                }
+            })
+            .collect()
+    });
 
     let snapshot_interval_slots = value_t_or_exit!(matches, "snapshot_interval_slots", u64);
     let maximum_local_snapshot_age = value_t_or_exit!(matches, "maximum_local_snapshot_age", u64);
@@ -1657,10 +1669,6 @@ pub fn main() {
         validator_config.halt_on_trusted_validators_accounts_hash_mismatch = true;
     }
 
-    if matches.value_of("signer_addr").is_some() {
-        warn!("--vote-signer-address ignored");
-    }
-
     let entrypoint_addr = matches.value_of("entrypoint").map(|entrypoint| {
         solana_net_utils::parse_host_port(entrypoint).unwrap_or_else(|e| {
             eprintln!("failed to parse entrypoint address: {}", e);
@@ -1690,11 +1698,6 @@ pub fn main() {
     };
     let use_progress_bar = logfile.is_none();
     let _logger_thread = start_logger(logfile);
-
-    // Default to RUST_BACKTRACE=1 for more informative validator logs
-    if env::var_os("RUST_BACKTRACE").is_none() {
-        env::set_var("RUST_BACKTRACE", "1")
-    }
 
     let gossip_host = matches
         .value_of("gossip_host")
@@ -1793,20 +1796,6 @@ pub fn main() {
         });
     }
     info!("Validator initialized");
-    validator.join().expect("validator exit");
+    validator.join();
     info!("Validator exiting..");
-}
-
-#[cfg(test)]
-pub mod tests {
-    use super::*;
-
-    #[test]
-    fn test_interval_check() {
-        assert!(!is_snapshot_config_invalid(0, 100));
-        assert!(is_snapshot_config_invalid(1, 100));
-        assert!(is_snapshot_config_invalid(230, 100));
-        assert!(!is_snapshot_config_invalid(500, 100));
-        assert!(!is_snapshot_config_invalid(5, 5));
-    }
 }

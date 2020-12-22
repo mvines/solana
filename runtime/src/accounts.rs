@@ -1,8 +1,6 @@
 use crate::{
-    accounts_db::{
-        AccountInfo, AccountStorage, AccountsDB, AppendVecId, BankHashInfo, ErrorCounters,
-    },
-    accounts_index::{AccountsIndex, Ancestors},
+    accounts_db::{AccountsDB, AppendVecId, BankHashInfo, ErrorCounters},
+    accounts_index::Ancestors,
     append_vec::StoredAccount,
     bank::{
         NonceRollbackFull, NonceRollbackInfo, TransactionCheckResult, TransactionExecutionResult,
@@ -18,6 +16,7 @@ use rayon::slice::ParallelSliceMut;
 use solana_sdk::{
     account::Account,
     account_utils::StateMut,
+    bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     clock::{Epoch, Slot},
     feature_set::{self, FeatureSet},
     fee_calculator::{FeeCalculator, FeeConfig},
@@ -120,8 +119,10 @@ impl Accounts {
     }
 
     fn construct_instructions_account(message: &Message) -> Account {
-        let mut account = Account::default();
-        account.data = message.serialize_instructions();
+        let mut account = Account {
+            data: message.serialize_instructions(),
+            ..Account::default()
+        };
 
         // add room for current instruction index.
         account.data.resize(account.data.len() + 2, 0);
@@ -130,9 +131,7 @@ impl Accounts {
 
     fn load_tx_accounts(
         &self,
-        storage: &AccountStorage,
         ancestors: &Ancestors,
-        accounts_index: &AccountsIndex<AccountInfo>,
         tx: &Transaction,
         fee: u64,
         error_counters: &mut ErrorCounters,
@@ -165,22 +164,22 @@ impl Accounts {
                         }
                         Self::construct_instructions_account(message)
                     } else {
-                        let (account, rent) =
-                            AccountsDB::load(storage, ancestors, accounts_index, key)
-                                .map(|(mut account, _)| {
-                                    if message.is_writable(i) {
-                                        let rent_due = rent_collector
-                                            .collect_from_existing_account(
-                                                &key,
-                                                &mut account,
-                                                rent_fix_enabled,
-                                            );
-                                        (account, rent_due)
-                                    } else {
-                                        (account, 0)
-                                    }
-                                })
-                                .unwrap_or_default();
+                        let (account, rent) = self
+                            .accounts_db
+                            .load(ancestors, key)
+                            .map(|(mut account, _)| {
+                                if message.is_writable(i) {
+                                    let rent_due = rent_collector.collect_from_existing_account(
+                                        &key,
+                                        &mut account,
+                                        rent_fix_enabled,
+                                    );
+                                    (account, rent_due)
+                                } else {
+                                    (account, 0)
+                                }
+                            })
+                            .unwrap_or_default();
 
                         tx_rent += rent;
                         account
@@ -228,9 +227,8 @@ impl Accounts {
     }
 
     fn load_executable_accounts(
-        storage: &AccountStorage,
+        &self,
         ancestors: &Ancestors,
-        accounts_index: &AccountsIndex<AccountInfo>,
         program_id: &Pubkey,
         error_counters: &mut ErrorCounters,
     ) -> Result<Vec<(Pubkey, Account)>> {
@@ -239,7 +237,7 @@ impl Accounts {
         let mut program_id = *program_id;
         loop {
             if native_loader::check_id(&program_id) {
-                // at the root of the chain, ready to dispatch
+                // At the root of the chain, ready to dispatch
                 break;
             }
 
@@ -249,7 +247,9 @@ impl Accounts {
             }
             depth += 1;
 
-            let program = match AccountsDB::load(storage, ancestors, accounts_index, &program_id)
+            let program = match self
+                .accounts_db
+                .load(ancestors, &program_id)
                 .map(|(account, _)| account)
             {
                 Some(program) => program,
@@ -263,8 +263,31 @@ impl Accounts {
                 return Err(TransactionError::InvalidProgramForExecution);
             }
 
-            // add loader to chain
+            // Add loader to chain
             let program_owner = program.owner;
+
+            if bpf_loader_upgradeable::check_id(&program_owner) {
+                // The upgradeable loader requires the derived ProgramData account
+                if let Ok(UpgradeableLoaderState::Program {
+                    programdata_address,
+                }) = program.state()
+                {
+                    if let Some(program) = self
+                        .accounts_db
+                        .load(ancestors, &programdata_address)
+                        .map(|(account, _)| account)
+                    {
+                        accounts.insert(0, (programdata_address, program));
+                    } else {
+                        error_counters.account_not_found += 1;
+                        return Err(TransactionError::ProgramAccountNotFound);
+                    }
+                } else {
+                    error_counters.invalid_program_for_execution += 1;
+                    return Err(TransactionError::InvalidProgramForExecution);
+                }
+            }
+
             accounts.insert(0, (program_id, program));
             program_id = program_owner;
         }
@@ -273,9 +296,8 @@ impl Accounts {
 
     /// For each program_id in the transaction, load its loaders.
     fn load_loaders(
-        storage: &AccountStorage,
+        &self,
         ancestors: &Ancestors,
-        accounts_index: &AccountsIndex<AccountInfo>,
         tx: &Transaction,
         error_counters: &mut ErrorCounters,
     ) -> Result<TransactionLoaders> {
@@ -289,13 +311,7 @@ impl Accounts {
                     return Err(TransactionError::AccountNotFound);
                 }
                 let program_id = message.account_keys[ix.program_id_index as usize];
-                Self::load_executable_accounts(
-                    storage,
-                    ancestors,
-                    accounts_index,
-                    &program_id,
-                    error_counters,
-                )
+                self.load_executable_accounts(ancestors, &program_id, error_counters)
             })
             .collect()
     }
@@ -311,8 +327,6 @@ impl Accounts {
         rent_collector: &RentCollector,
         feature_set: &FeatureSet,
     ) -> Vec<TransactionLoadResult> {
-        let accounts_index = &self.accounts_db.accounts_index;
-
         let fee_config = FeeConfig {
             secp256k1_program_enabled: feature_set
                 .is_active(&feature_set::secp256k1_program_enabled::id()),
@@ -336,9 +350,7 @@ impl Accounts {
                     };
 
                     let load_res = self.load_tx_accounts(
-                        &self.accounts_db.storage,
                         ancestors,
-                        accounts_index,
                         tx,
                         fee,
                         error_counters,
@@ -350,13 +362,7 @@ impl Accounts {
                         Err(e) => return (Err(e), None),
                     };
 
-                    let load_res = Self::load_loaders(
-                        &self.accounts_db.storage,
-                        ancestors,
-                        accounts_index,
-                        tx,
-                        error_counters,
-                    );
+                    let load_res = self.load_loaders(ancestors, tx, error_counters);
                     let loaders = match load_res {
                         Ok(loaders) => loaders,
                         Err(e) => return (Err(e), None),
@@ -480,7 +486,11 @@ impl Accounts {
         accounts_balances
     }
 
-    pub fn calculate_capitalization(&self, ancestors: &Ancestors) -> u64 {
+    pub fn calculate_capitalization(
+        &self,
+        ancestors: &Ancestors,
+        simple_capitalization_enabled: bool,
+    ) -> u64 {
         let balances =
             self.load_all_unchecked(ancestors)
                 .into_iter()
@@ -489,6 +499,7 @@ impl Accounts {
                         account.lamports,
                         &account.owner,
                         account.executable,
+                        simple_capitalization_enabled,
                     )
                 });
 
@@ -501,11 +512,14 @@ impl Accounts {
         slot: Slot,
         ancestors: &Ancestors,
         total_lamports: u64,
+        simple_capitalization_enabled: bool,
     ) -> bool {
-        if let Err(err) =
-            self.accounts_db
-                .verify_bank_hash_and_lamports(slot, ancestors, total_lamports)
-        {
+        if let Err(err) = self.accounts_db.verify_bank_hash_and_lamports(
+            slot,
+            ancestors,
+            total_lamports,
+            simple_capitalization_enabled,
+        ) {
             warn!("verify_bank_hash failed: {:?}", err);
             false
         } else {
@@ -1549,10 +1563,8 @@ mod tests {
         let ancestors = vec![(0, 0)].into_iter().collect();
 
         assert_eq!(
-            Accounts::load_executable_accounts(
-                &accounts.accounts_db.storage,
+            accounts.load_executable_accounts(
                 &ancestors,
-                &accounts.accounts_db.accounts_index,
                 &solana_sdk::pubkey::new_rand(),
                 &mut error_counters
             ),

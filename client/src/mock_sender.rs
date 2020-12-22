@@ -48,6 +48,10 @@ impl RpcSender for MockSender {
             return Ok(Value::Null);
         }
         let val = match request {
+            RpcRequest::GetAccountInfo => serde_json::to_value(Response {
+                context: RpcResponseContext { slot: 1 },
+                value: Value::Null,
+            })?,
             RpcRequest::GetBalance => serde_json::to_value(Response {
                 context: RpcResponseContext { slot: 1 },
                 value: Value::Number(Number::from(50)),
@@ -65,6 +69,7 @@ impl RpcSender for MockSender {
                 slots_in_epoch: 32,
                 absolute_slot: 34,
                 block_height: 34,
+                transaction_count: Some(123),
             })?,
             RpcRequest::GetFeeCalculatorForBlockhash => {
                 let value = if self.url == "blockhash_expired" {

@@ -8,6 +8,10 @@ static const uint8_t TEST_SUCCESS = 1;
 static const uint8_t TEST_PRIVILEGE_ESCALATION_SIGNER = 2;
 static const uint8_t TEST_PRIVILEGE_ESCALATION_WRITABLE = 3;
 static const uint8_t TEST_PPROGRAM_NOT_EXECUTABLE = 4;
+static const uint8_t TEST_EMPTY_ACCOUNTS_SLICE = 5;
+static const uint8_t TEST_CAP_SEEDS = 6;
+static const uint8_t TEST_CAP_SIGNERS = 7;
+static const uint8_t TEST_ALLOC_ACCESS_VIOLATION = 8;
 
 static const int MINT_INDEX = 0;
 static const int ARGUMENT_INDEX = 1;
@@ -152,6 +156,20 @@ extern uint64_t entrypoint(const uint8_t *input) {
       sol_assert(SolPubkey_same(&address, accounts[DERIVED_KEY1_INDEX].key));
     }
 
+    sol_log("Test try_find_program_address");
+    {
+      uint8_t seed[] = {'Y', 'o', 'u', ' ', 'p', 'a', 's', 's',
+                        ' ', 'b', 'u', 't', 't', 'e', 'r'};
+      const SolSignerSeed seeds[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+      SolPubkey address;
+      uint8_t bump_seed;
+      sol_assert(SUCCESS == sol_try_find_program_address(
+                                seeds, SOL_ARRAY_SIZE(seeds), params.program_id,
+                                &address, &bump_seed));
+      sol_assert(SolPubkey_same(&address, accounts[DERIVED_KEY1_INDEX].key));
+      sol_assert(bump_seed == bump_seed1);
+    }
+
     sol_log("Test derived signers");
     {
       sol_assert(!accounts[DERIVED_KEY1_INDEX].is_signer);
@@ -269,6 +287,122 @@ extern uint64_t entrypoint(const uint8_t *input) {
                                         SOL_ARRAY_SIZE(arguments), data,
                                         SOL_ARRAY_SIZE(data)};
     return sol_invoke(&instruction, accounts, SOL_ARRAY_SIZE(accounts));
+  }
+  case TEST_EMPTY_ACCOUNTS_SLICE: {
+    sol_log("Empty accounts slice");
+
+    SolAccountMeta arguments[] = {};
+    uint8_t data[] = {};
+    const SolInstruction instruction = {accounts[INVOKED_PROGRAM_INDEX].key,
+                                        arguments, SOL_ARRAY_SIZE(arguments),
+                                        data, SOL_ARRAY_SIZE(data)};
+
+    sol_assert(SUCCESS == sol_invoke(&instruction, 0, 0));
+    break;
+  }
+  case TEST_CAP_SEEDS: {
+    sol_log("Test cap seeds");
+    SolAccountMeta arguments[] = {};
+    uint8_t data[] = {};
+    const SolInstruction instruction = {accounts[INVOKED_PROGRAM_INDEX].key,
+                                        arguments, SOL_ARRAY_SIZE(arguments),
+                                        data, SOL_ARRAY_SIZE(data)};
+    uint8_t seed[] = {"seed"};
+    const SolSignerSeed seeds[] = {
+        {seed, SOL_ARRAY_SIZE(seed)}, {seed, SOL_ARRAY_SIZE(seed)},
+        {seed, SOL_ARRAY_SIZE(seed)}, {seed, SOL_ARRAY_SIZE(seed)},
+        {seed, SOL_ARRAY_SIZE(seed)}, {seed, SOL_ARRAY_SIZE(seed)},
+        {seed, SOL_ARRAY_SIZE(seed)}, {seed, SOL_ARRAY_SIZE(seed)},
+        {seed, SOL_ARRAY_SIZE(seed)}, {seed, SOL_ARRAY_SIZE(seed)},
+        {seed, SOL_ARRAY_SIZE(seed)}, {seed, SOL_ARRAY_SIZE(seed)},
+        {seed, SOL_ARRAY_SIZE(seed)}, {seed, SOL_ARRAY_SIZE(seed)},
+        {seed, SOL_ARRAY_SIZE(seed)}, {seed, SOL_ARRAY_SIZE(seed)},
+        {seed, SOL_ARRAY_SIZE(seed)},
+    };
+    const SolSignerSeeds signers_seeds[] = {{seeds, SOL_ARRAY_SIZE(seeds)}};
+    sol_assert(SUCCESS == sol_invoke_signed(
+                              &instruction, accounts, SOL_ARRAY_SIZE(accounts),
+                              signers_seeds, SOL_ARRAY_SIZE(signers_seeds)));
+    break;
+  }
+  case TEST_CAP_SIGNERS: {
+    sol_log("Test cap signers");
+    SolAccountMeta arguments[] = {};
+    uint8_t data[] = {};
+    const SolInstruction instruction = {accounts[INVOKED_PROGRAM_INDEX].key,
+                                        arguments, SOL_ARRAY_SIZE(arguments),
+                                        data, SOL_ARRAY_SIZE(data)};
+    uint8_t seed[] = {"seed"};
+    const SolSignerSeed seed1[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed2[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed3[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed4[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed5[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed6[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed7[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed8[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed9[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed10[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed11[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed12[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed13[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed14[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed15[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed16[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeed seed17[] = {{seed, SOL_ARRAY_SIZE(seed)}};
+    const SolSignerSeeds signers_seeds[] = {
+        {seed1, SOL_ARRAY_SIZE(seed1)},   {seed2, SOL_ARRAY_SIZE(seed2)},
+        {seed3, SOL_ARRAY_SIZE(seed3)},   {seed4, SOL_ARRAY_SIZE(seed4)},
+        {seed5, SOL_ARRAY_SIZE(seed5)},   {seed6, SOL_ARRAY_SIZE(seed6)},
+        {seed7, SOL_ARRAY_SIZE(seed7)},   {seed8, SOL_ARRAY_SIZE(seed8)},
+        {seed9, SOL_ARRAY_SIZE(seed9)},   {seed10, SOL_ARRAY_SIZE(seed10)},
+        {seed11, SOL_ARRAY_SIZE(seed11)}, {seed12, SOL_ARRAY_SIZE(seed12)},
+        {seed13, SOL_ARRAY_SIZE(seed13)}, {seed14, SOL_ARRAY_SIZE(seed14)},
+        {seed15, SOL_ARRAY_SIZE(seed15)}, {seed16, SOL_ARRAY_SIZE(seed16)},
+        {seed17, SOL_ARRAY_SIZE(seed17)}};
+    sol_assert(SUCCESS == sol_invoke_signed(
+                              &instruction, accounts, SOL_ARRAY_SIZE(accounts),
+                              signers_seeds, SOL_ARRAY_SIZE(signers_seeds)));
+    break;
+  }
+  case TEST_ALLOC_ACCESS_VIOLATION: {
+    sol_log("Test resize violation");
+    SolAccountMeta arguments[] = {
+        {accounts[FROM_INDEX].key, true, true},
+        {accounts[DERIVED_KEY1_INDEX].key, true, true}};
+    uint8_t data[4 + 8 + 8 + 32];
+    *(uint64_t *)(data + 4) = 42;
+    *(uint64_t *)(data + 4 + 8) = MAX_PERMITTED_DATA_INCREASE;
+    sol_memcpy(data + 4 + 8 + 8, params.program_id, SIZE_PUBKEY);
+    const SolInstruction instruction = {accounts[SYSTEM_PROGRAM_INDEX].key,
+                                        arguments, SOL_ARRAY_SIZE(arguments),
+                                        data, SOL_ARRAY_SIZE(data)};
+    uint8_t seed1[] = {'Y', 'o', 'u', ' ', 'p', 'a', 's', 's',
+                       ' ', 'b', 'u', 't', 't', 'e', 'r'};
+    const SolSignerSeed seeds1[] = {{seed1, SOL_ARRAY_SIZE(seed1)},
+                                    {&bump_seed1, 1}};
+    const SolSignerSeeds signers_seeds[] = {{seeds1, SOL_ARRAY_SIZE(seeds1)}};
+
+    SolAccountInfo derived_account = {
+        .key = accounts[DERIVED_KEY1_INDEX].key,
+        .lamports = accounts[DERIVED_KEY1_INDEX].lamports,
+        .data_len = accounts[DERIVED_KEY1_INDEX].data_len,
+        // Point to top edge of heap, attempt to allocate into unprivileged
+        // memory
+        .data = (uint8_t *)0x300007ff8,
+        .owner = accounts[DERIVED_KEY1_INDEX].owner,
+        .rent_epoch = accounts[DERIVED_KEY1_INDEX].rent_epoch,
+        .is_signer = accounts[DERIVED_KEY1_INDEX].is_signer,
+        .is_writable = accounts[DERIVED_KEY1_INDEX].is_writable,
+        .executable = accounts[DERIVED_KEY1_INDEX].executable,
+    };
+    const SolAccountInfo invoke_accounts[] = {
+        accounts[FROM_INDEX], accounts[SYSTEM_PROGRAM_INDEX], derived_account};
+    sol_assert(SUCCESS ==
+               sol_invoke_signed(&instruction,
+                                 (const SolAccountInfo *)invoke_accounts, 3,
+                                 signers_seeds, SOL_ARRAY_SIZE(signers_seeds)));
+    break;
   }
   default:
     sol_panic();

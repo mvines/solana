@@ -2,189 +2,454 @@ use {
     crate::{
         cluster_info::Node,
         gossip_service::discover_cluster,
+        rpc::JsonRpcConfig,
         validator::{Validator, ValidatorConfig},
     },
-    solana_ledger::create_new_tmp_ledger,
+    solana_client::rpc_client::RpcClient,
+    solana_ledger::{blockstore::create_new_ledger, create_new_tmp_ledger},
+    solana_runtime::{
+        bank_forks::{CompressionType, SnapshotConfig, SnapshotVersion},
+        genesis_utils::create_genesis_config_with_leader_ex,
+        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+    },
     solana_sdk::{
-        fee_calculator::FeeRateGovernor,
+        account::Account,
+        clock::DEFAULT_MS_PER_SLOT,
+        commitment_config::CommitmentConfig,
+        fee_calculator::{FeeCalculator, FeeRateGovernor},
         hash::Hash,
         native_token::sol_to_lamports,
         pubkey::Pubkey,
         rent::Rent,
-        signature::{Keypair, Signer},
+        signature::{read_keypair_file, write_keypair_file, Keypair, Signer},
     },
-    std::{fs::remove_dir_all, net::SocketAddr, path::PathBuf, sync::Arc},
+    std::{
+        collections::HashMap, fs::remove_dir_all, net::SocketAddr, path::PathBuf, sync::Arc,
+        thread::sleep, time::Duration,
+    },
 };
 
-pub struct TestValidatorConfig {
-    pub fee_rate_governor: FeeRateGovernor,
-    pub mint_lamports: u64,
-    pub rent: Rent,
-    pub validator_identity_keypair: Keypair,
-    pub validator_identity_lamports: u64,
-    pub validator_stake_lamports: u64,
+#[derive(Clone)]
+pub struct ProgramInfo {
+    pub program_id: Pubkey,
+    pub loader: Pubkey,
+    pub program_path: PathBuf,
 }
 
-impl Default for TestValidatorConfig {
-    fn default() -> Self {
-        Self {
-            fee_rate_governor: FeeRateGovernor::default(),
-            mint_lamports: sol_to_lamports(500_000_000.),
-            rent: Rent::default(),
-            validator_identity_keypair: Keypair::new(),
-            validator_identity_lamports: sol_to_lamports(500.),
-            validator_stake_lamports: sol_to_lamports(1.),
+#[derive(Default)]
+pub struct TestValidatorGenesis {
+    fee_rate_governor: FeeRateGovernor,
+    ledger_path: Option<PathBuf>,
+    rent: Rent,
+    rpc_config: JsonRpcConfig,
+    rpc_ports: Option<(u16, u16)>, // (JsonRpc, JsonRpcPubSub), None == random ports
+    accounts: HashMap<Pubkey, Account>,
+    programs: Vec<ProgramInfo>,
+}
+
+impl TestValidatorGenesis {
+    pub fn ledger_path<P: Into<PathBuf>>(&mut self, ledger_path: P) -> &mut Self {
+        self.ledger_path = Some(ledger_path.into());
+        self
+    }
+
+    pub fn fee_rate_governor(&mut self, fee_rate_governor: FeeRateGovernor) -> &mut Self {
+        self.fee_rate_governor = fee_rate_governor;
+        self
+    }
+
+    pub fn rent(&mut self, rent: Rent) -> &mut Self {
+        self.rent = rent;
+        self
+    }
+
+    pub fn rpc_config(&mut self, rpc_config: JsonRpcConfig) -> &mut Self {
+        self.rpc_config = rpc_config;
+        self
+    }
+
+    pub fn rpc_port(&mut self, rpc_port: u16) -> &mut Self {
+        self.rpc_ports = Some((rpc_port, rpc_port + 1));
+        self
+    }
+
+    /// Add an account to the test environment
+    pub fn add_account(&mut self, address: Pubkey, account: Account) -> &mut Self {
+        self.accounts.insert(address, account);
+        self
+    }
+
+    /// Add an account to the test environment with the account data in the provided `filename`
+    pub fn add_account_with_file_data(
+        &mut self,
+        address: Pubkey,
+        lamports: u64,
+        owner: Pubkey,
+        filename: &str,
+    ) -> &mut Self {
+        self.add_account(
+            address,
+            Account {
+                lamports,
+                data: solana_program_test::read_file(
+                    solana_program_test::find_file(filename).unwrap_or_else(|| {
+                        panic!("Unable to locate {}", filename);
+                    }),
+                ),
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+    }
+
+    /// Add an account to the test environment with the account data in the provided as a base 64
+    /// string
+    pub fn add_account_with_base64_data(
+        &mut self,
+        address: Pubkey,
+        lamports: u64,
+        owner: Pubkey,
+        data_base64: &str,
+    ) -> &mut Self {
+        self.add_account(
+            address,
+            Account {
+                lamports,
+                data: base64::decode(data_base64)
+                    .unwrap_or_else(|err| panic!("Failed to base64 decode: {}", err)),
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+    }
+
+    /// Add a BPF program to the test environment.
+    ///
+    /// `program_name` will also used to locate the BPF shared object in the current or fixtures
+    /// directory.
+    pub fn add_program(&mut self, program_name: &str, program_id: Pubkey) -> &mut Self {
+        let program_path = solana_program_test::find_file(&format!("{}.so", program_name))
+            .unwrap_or_else(|| panic!("Unable to locate program {}", program_name));
+
+        self.programs.push(ProgramInfo {
+            program_id,
+            loader: solana_sdk::bpf_loader::id(),
+            program_path,
+        });
+        self
+    }
+
+    /// Add a list of programs to the test environment.
+    ///pub fn add_programs_with_path<'a>(&'a mut self, programs: &[ProgramInfo]) -> &'a mut Self {
+    pub fn add_programs_with_path(&mut self, programs: &[ProgramInfo]) -> &mut Self {
+        for program in programs {
+            self.programs.push(program.clone());
         }
+        self
+    }
+
+    /// Start a test validator with the address of the mint account that will receive tokens
+    /// created at genesis.
+    ///
+    pub fn start_with_mint_address(
+        &self,
+        mint_address: Pubkey,
+    ) -> Result<TestValidator, Box<dyn std::error::Error>> {
+        TestValidator::start(mint_address, self)
+    }
+
+    /// Start a test validator
+    ///
+    /// Returns a new `TestValidator` as well as the keypair for the mint account that will receive tokens
+    /// created at genesis.
+    ///
+    /// This function panics on initialization failure.
+    pub fn start(&self) -> (TestValidator, Keypair) {
+        let mint_keypair = Keypair::new();
+        TestValidator::start(mint_keypair.pubkey(), self)
+            .map(|test_validator| (test_validator, mint_keypair))
+            .expect("Test validator failed to start")
     }
 }
 
 pub struct TestValidator {
-    validator: Validator,
     ledger_path: PathBuf,
     preserve_ledger: bool,
-
-    genesis_hash: Hash,
-    mint_keypair: Keypair,
-    vote_account_address: Pubkey,
-
-    tpu: SocketAddr,
-    rpc_url: String,
     rpc_pubsub_url: String,
-}
-
-impl Default for TestValidator {
-    fn default() -> Self {
-        Self::new(TestValidatorConfig::default())
-    }
+    rpc_url: String,
+    tpu: SocketAddr,
+    gossip: SocketAddr,
+    validator: Option<Validator>,
+    vote_account_address: Pubkey,
 }
 
 impl TestValidator {
-    pub fn with_no_fees() -> Self {
-        Self::new(TestValidatorConfig {
-            fee_rate_governor: FeeRateGovernor::new(0, 0),
-            rent: Rent {
+    /// Create and start a `TestValidator` with no transaction fees and minimal rent.
+    ///
+    /// This function panics on initialization failure.
+    pub fn with_no_fees(mint_address: Pubkey) -> Self {
+        TestValidatorGenesis::default()
+            .fee_rate_governor(FeeRateGovernor::new(0, 0))
+            .rent(Rent {
                 lamports_per_byte_year: 1,
                 exemption_threshold: 1.0,
                 ..Rent::default()
-            },
-            ..TestValidatorConfig::default()
-        })
+            })
+            .start_with_mint_address(mint_address)
+            .expect("validator start failed")
     }
 
-    pub fn with_custom_fees(target_lamports_per_signature: u64) -> Self {
-        Self::new(TestValidatorConfig {
-            fee_rate_governor: FeeRateGovernor::new(target_lamports_per_signature, 0),
-            rent: Rent {
+    /// Create and start a `TestValidator` with custom transaction fees and minimal rent.
+    ///
+    /// This function panics on initialization failure.
+    pub fn with_custom_fees(mint_address: Pubkey, target_lamports_per_signature: u64) -> Self {
+        TestValidatorGenesis::default()
+            .fee_rate_governor(FeeRateGovernor::new(target_lamports_per_signature, 0))
+            .rent(Rent {
                 lamports_per_byte_year: 1,
                 exemption_threshold: 1.0,
                 ..Rent::default()
-            },
-            ..TestValidatorConfig::default()
-        })
+            })
+            .start_with_mint_address(mint_address)
+            .expect("validator start failed")
     }
 
-    pub fn new(config: TestValidatorConfig) -> Self {
-        use solana_ledger::genesis_utils::{
-            create_genesis_config_with_leader_ex, GenesisConfigInfo,
-        };
+    /// Initialize the ledger directory
+    ///
+    /// If `ledger_path` is `None`, a temporary ledger will be created.  Otherwise the ledger will
+    /// be initialized in the provided directory if it doesn't already exist.
+    ///
+    /// Returns the path to the ledger directory.
+    fn initialize_ledger(
+        mint_address: Pubkey,
+        config: &TestValidatorGenesis,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let validator_identity = Keypair::new();
+        let validator_vote_account = Keypair::new();
+        let validator_stake_account = Keypair::new();
+        let validator_identity_lamports = sol_to_lamports(500.);
+        let validator_stake_lamports = sol_to_lamports(1_000_000.);
+        let mint_lamports = sol_to_lamports(500_000_000.);
 
-        let TestValidatorConfig {
-            fee_rate_governor,
+        let mut accounts = config.accounts.clone();
+        for (address, account) in solana_program_test::programs::spl_programs(&config.rent) {
+            accounts.entry(address).or_insert(account);
+        }
+        for program in &config.programs {
+            let data = solana_program_test::read_file(&program.program_path);
+            accounts.insert(
+                program.program_id,
+                Account {
+                    lamports: Rent::default().minimum_balance(data.len()).min(1),
+                    data,
+                    owner: program.loader,
+                    executable: true,
+                    rent_epoch: 0,
+                },
+            );
+        }
+
+        let genesis_config = create_genesis_config_with_leader_ex(
             mint_lamports,
-            rent,
-            validator_identity_keypair,
-            validator_identity_lamports,
-            validator_stake_lamports,
-        } = config;
-        let validator_identity_keypair = Arc::new(validator_identity_keypair);
-
-        let node = Node::new_localhost_with_pubkey(&validator_identity_keypair.pubkey());
-
-        let GenesisConfigInfo {
-            mut genesis_config,
-            mint_keypair,
-            voting_keypair: vote_account_keypair,
-        } = create_genesis_config_with_leader_ex(
-            mint_lamports,
-            &node.info.id,
-            &Keypair::new(),
-            &Keypair::new().pubkey(),
+            &mint_address,
+            &validator_identity.pubkey(),
+            &validator_vote_account.pubkey(),
+            &validator_stake_account.pubkey(),
             validator_stake_lamports,
             validator_identity_lamports,
+            config.fee_rate_governor.clone(),
+            config.rent,
             solana_sdk::genesis_config::ClusterType::Development,
+            accounts.into_iter().collect(),
         );
 
-        genesis_config.rent = rent;
-        genesis_config.fee_rate_governor = fee_rate_governor;
+        let ledger_path = match &config.ledger_path {
+            None => create_new_tmp_ledger!(&genesis_config).0,
+            Some(ledger_path) => {
+                if ledger_path.join("validator-keypair.json").exists() {
+                    return Ok(ledger_path.to_path_buf());
+                }
 
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
-
-        let config = ValidatorConfig {
-            rpc_addrs: Some((node.info.rpc, node.info.rpc_pubsub)),
-            ..ValidatorConfig::default()
+                let _ = create_new_ledger(
+                    ledger_path,
+                    &genesis_config,
+                    MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+                    solana_ledger::blockstore_db::AccessType::PrimaryOnly,
+                )
+                .map_err(|err| {
+                    format!(
+                        "Failed to create ledger at {}: {}",
+                        ledger_path.display(),
+                        err
+                    )
+                })?;
+                ledger_path.to_path_buf()
+            }
         };
 
-        let vote_account_address = vote_account_keypair.pubkey();
+        write_keypair_file(
+            &validator_identity,
+            ledger_path.join("validator-keypair.json").to_str().unwrap(),
+        )?;
+        write_keypair_file(
+            &validator_vote_account,
+            ledger_path
+                .join("vote-account-keypair.json")
+                .to_str()
+                .unwrap(),
+        )?;
+
+        Ok(ledger_path)
+    }
+
+    /// Starts a TestValidator at the provided ledger directory
+    fn start(
+        mint_address: Pubkey,
+        config: &TestValidatorGenesis,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let preserve_ledger = config.ledger_path.is_some();
+        let ledger_path = TestValidator::initialize_ledger(mint_address, config)?;
+
+        let validator_identity =
+            read_keypair_file(ledger_path.join("validator-keypair.json").to_str().unwrap())?;
+        let validator_vote_account = read_keypair_file(
+            ledger_path
+                .join("vote-account-keypair.json")
+                .to_str()
+                .unwrap(),
+        )?;
+
+        let mut node = Node::new_localhost_with_pubkey(&validator_identity.pubkey());
+        if let Some((rpc, rpc_pubsub)) = config.rpc_ports {
+            node.info.rpc = SocketAddr::new(node.info.gossip.ip(), rpc);
+            node.info.rpc_pubsub = SocketAddr::new(node.info.gossip.ip(), rpc_pubsub);
+        }
+
+        let vote_account_address = validator_vote_account.pubkey();
         let rpc_url = format!("http://{}:{}", node.info.rpc.ip(), node.info.rpc.port());
         let rpc_pubsub_url = format!("ws://{}/", node.info.rpc_pubsub);
         let tpu = node.info.tpu;
         let gossip = node.info.gossip;
 
-        let validator = Validator::new(
+        let validator_config = ValidatorConfig {
+            rpc_addrs: Some((node.info.rpc, node.info.rpc_pubsub)),
+            rpc_config: config.rpc_config.clone(),
+            accounts_hash_interval_slots: 100,
+            account_paths: vec![ledger_path.join("accounts")],
+            poh_verify: false, // Skip PoH verification of ledger on startup for speed
+            snapshot_config: Some(SnapshotConfig {
+                snapshot_interval_slots: 100,
+                snapshot_path: ledger_path.join("snapshot"),
+                snapshot_package_output_path: ledger_path.to_path_buf(),
+                compression: CompressionType::NoCompression,
+                snapshot_version: SnapshotVersion::default(),
+            }),
+            enforce_ulimit_nofile: false,
+            ..ValidatorConfig::default()
+        };
+
+        let validator = Some(Validator::new(
             node,
-            &validator_identity_keypair,
+            &Arc::new(validator_identity),
             &ledger_path,
-            &vote_account_keypair.pubkey(),
-            vec![Arc::new(vote_account_keypair)],
+            &validator_vote_account.pubkey(),
+            vec![Arc::new(validator_vote_account)],
             None,
-            &config,
-        );
+            &validator_config,
+        ));
 
         // Needed to avoid panics in `solana-responder-gossip` in tests that create a number of
         // test validators concurrently...
         discover_cluster(&gossip, 1).expect("TestValidator startup failed");
 
-        TestValidator {
+        // This is a hack to delay until the fees are non-zero for test consistency
+        // (fees from genesis are zero until the first block with a transaction in it is completed
+        //  due to a bug in the Bank)
+        {
+            let rpc_client =
+                RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::recent());
+            let fee_rate_governor = rpc_client
+                .get_fee_rate_governor()
+                .expect("get_fee_rate_governor")
+                .value;
+            if fee_rate_governor.target_lamports_per_signature > 0 {
+                while rpc_client
+                    .get_recent_blockhash()
+                    .expect("get_recent_blockhash")
+                    .1
+                    .lamports_per_signature
+                    == 0
+                {
+                    sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT));
+                }
+            }
+        }
+
+        Ok(TestValidator {
+            ledger_path,
+            preserve_ledger,
+            rpc_pubsub_url,
+            rpc_url,
+            gossip,
+            tpu,
             validator,
             vote_account_address,
-            mint_keypair,
-            ledger_path,
-            genesis_hash: blockhash,
-            tpu,
-            rpc_url,
-            rpc_pubsub_url,
-            preserve_ledger: false,
-        }
+        })
     }
 
-    pub fn close(self) {
-        self.validator.close().unwrap();
-        if !self.preserve_ledger {
-            remove_dir_all(&self.ledger_path).unwrap();
-        }
-    }
-
+    /// Return the validator's TPU address
     pub fn tpu(&self) -> &SocketAddr {
         &self.tpu
     }
 
-    pub fn mint_keypair(&self) -> Keypair {
-        Keypair::from_bytes(&self.mint_keypair.to_bytes()).unwrap()
+    /// Return the validator's Gossip address
+    pub fn gossip(&self) -> &SocketAddr {
+        &self.gossip
     }
 
+    /// Return the validator's JSON RPC URL
     pub fn rpc_url(&self) -> String {
         self.rpc_url.clone()
     }
 
+    /// Return the validator's JSON RPC PubSub URL
     pub fn rpc_pubsub_url(&self) -> String {
         self.rpc_pubsub_url.clone()
     }
 
-    pub fn genesis_hash(&self) -> Hash {
-        self.genesis_hash
-    }
-
+    /// Return the validator's vote account address
     pub fn vote_account_address(&self) -> Pubkey {
         self.vote_account_address
+    }
+
+    /// Return an RpcClient for the validator.  As a convenience, also return a recent blockhash and
+    /// associated fee calculator
+    pub fn rpc_client(&self) -> (RpcClient, Hash, FeeCalculator) {
+        let rpc_client =
+            RpcClient::new_with_commitment(self.rpc_url.clone(), CommitmentConfig::recent());
+        let (recent_blockhash, fee_calculator) = rpc_client
+            .get_recent_blockhash()
+            .expect("get_recent_blockhash");
+
+        (rpc_client, recent_blockhash, fee_calculator)
+    }
+}
+
+impl Drop for TestValidator {
+    fn drop(&mut self) {
+        if let Some(validator) = self.validator.take() {
+            validator.close();
+        }
+        if !self.preserve_ledger {
+            remove_dir_all(&self.ledger_path).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to remove ledger directory {}: {}",
+                    self.ledger_path.display(),
+                    err
+                )
+            });
+        }
     }
 }

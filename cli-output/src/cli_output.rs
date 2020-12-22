@@ -241,6 +241,9 @@ impl fmt::Display for CliEpochInfo {
         )?;
         writeln_name_value(f, "Slot:", &self.epoch_info.absolute_slot.to_string())?;
         writeln_name_value(f, "Epoch:", &self.epoch_info.epoch.to_string())?;
+        if let Some(transaction_count) = &self.epoch_info.transaction_count {
+            writeln_name_value(f, "Transaction Count:", &transaction_count.to_string())?;
+        }
         let start_slot = self.epoch_info.absolute_slot - self.epoch_info.slot_index;
         let end_slot = start_slot + self.epoch_info.slots_in_epoch;
         writeln_name_value(
@@ -541,7 +544,15 @@ impl CliStakeVec {
 }
 
 impl QuietDisplay for CliStakeVec {}
-impl VerboseDisplay for CliStakeVec {}
+impl VerboseDisplay for CliStakeVec {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        for state in &self.0 {
+            writeln!(w)?;
+            VerboseDisplay::write_str(state, w)?;
+        }
+        Ok(())
+    }
+}
 
 impl fmt::Display for CliStakeVec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -562,7 +573,12 @@ pub struct CliKeyedStakeState {
 }
 
 impl QuietDisplay for CliKeyedStakeState {}
-impl VerboseDisplay for CliKeyedStakeState {}
+impl VerboseDisplay for CliKeyedStakeState {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        writeln!(w, "Stake Pubkey: {}", self.stake_pubkey)?;
+        VerboseDisplay::write_str(&self.stake_state, w)
+    }
+}
 
 impl fmt::Display for CliKeyedStakeState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -579,7 +595,7 @@ pub struct CliEpochReward {
     pub amount: u64,       // lamports
     pub post_balance: u64, // lamports
     pub percent_change: f64,
-    pub apr: f64,
+    pub apr: Option<f64>,
 }
 
 fn show_votes_and_credits(
@@ -639,13 +655,16 @@ fn show_epoch_rewards(
         for reward in epoch_rewards {
             writeln!(
                 f,
-                "  {:<8}  {:<11}  ◎{:<14.9}  ◎{:<14.9}  {:>13.9}%  {:>13.9}%",
+                "  {:<8}  {:<11}  ◎{:<14.9}  ◎{:<14.9}  {:>13.9}%  {}",
                 reward.epoch,
                 reward.effective_slot,
                 lamports_to_sol(reward.amount),
                 lamports_to_sol(reward.post_balance),
                 reward.percent_change,
-                reward.apr,
+                reward
+                    .apr
+                    .map(|apr| format!("{:>13.9}%", apr))
+                    .unwrap_or_default(),
             )?;
         }
     }
@@ -657,6 +676,8 @@ fn show_epoch_rewards(
 pub struct CliStakeState {
     pub stake_type: CliStakeType,
     pub account_balance: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits_observed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegated_stake: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -686,7 +707,15 @@ pub struct CliStakeState {
 }
 
 impl QuietDisplay for CliStakeState {}
-impl VerboseDisplay for CliStakeState {}
+impl VerboseDisplay for CliStakeState {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(w, "{}", self)?;
+        if let Some(credits) = self.credits_observed {
+            writeln!(w, "Credits Observed: {}", credits)?;
+        }
+        Ok(())
+    }
+}
 
 impl fmt::Display for CliStakeState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -20,6 +20,10 @@ const TEST_SUCCESS: u8 = 1;
 const TEST_PRIVILEGE_ESCALATION_SIGNER: u8 = 2;
 const TEST_PRIVILEGE_ESCALATION_WRITABLE: u8 = 3;
 const TEST_PPROGRAM_NOT_EXECUTABLE: u8 = 4;
+const TEST_EMPTY_ACCOUNTS_SLICE: u8 = 5;
+const TEST_CAP_SEEDS: u8 = 6;
+const TEST_CAP_SIGNERS: u8 = 7;
+const TEST_ALLOC_ACCESS_VIOLATION: u8 = 8;
 
 // const MINT_INDEX: usize = 0;
 const ARGUMENT_INDEX: usize = 1;
@@ -30,7 +34,7 @@ const INVOKED_PROGRAM_DUP_INDEX: usize = 4;
 const DERIVED_KEY1_INDEX: usize = 6;
 const DERIVED_KEY2_INDEX: usize = 7;
 const DERIVED_KEY3_INDEX: usize = 8;
-// const SYSTEM_PROGRAM_INDEX: usize = 9;
+const SYSTEM_PROGRAM_INDEX: usize = 9;
 const FROM_INDEX: usize = 10;
 
 entrypoint!(process_instruction);
@@ -256,6 +260,19 @@ fn process_instruction(
                 );
             }
 
+            msg!("Test try_find_program_address");
+            {
+                let (address, bump_seed) =
+                    Pubkey::try_find_program_address(&[b"You pass butter"], program_id).unwrap();
+                assert_eq!(&address, accounts[DERIVED_KEY1_INDEX].key);
+                assert_eq!(bump_seed, bump_seed1);
+                assert_eq!(
+                    Pubkey::create_program_address(&[b"You pass butter"], &Pubkey::default())
+                        .unwrap_err(),
+                    PubkeyError::InvalidSeeds
+                );
+            }
+
             msg!("Test derived signers");
             {
                 assert!(!accounts[DERIVED_KEY1_INDEX].is_signer);
@@ -365,6 +382,116 @@ fn process_instruction(
                 vec![TEST_RETURN_ERROR],
             );
             invoke(&instruction, accounts)?;
+        }
+        TEST_EMPTY_ACCOUNTS_SLICE => {
+            msg!("Empty accounts slice");
+            let instruction = create_instruction(*accounts[INVOKED_PROGRAM_INDEX].key, &[], vec![]);
+            invoke(&instruction, &[])?;
+        }
+        TEST_CAP_SEEDS => {
+            msg!("Test program max seeds");
+            let instruction = create_instruction(*accounts[INVOKED_PROGRAM_INDEX].key, &[], vec![]);
+            invoke_signed(
+                &instruction,
+                accounts,
+                &[&[
+                    b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8", b"9", b"0", b"1", b"2", b"3",
+                    b"4", b"5", b"6", b"7",
+                ]],
+            )?;
+        }
+        TEST_CAP_SIGNERS => {
+            msg!("Test program max signers");
+            let instruction = create_instruction(*accounts[INVOKED_PROGRAM_INDEX].key, &[], vec![]);
+            invoke_signed(
+                &instruction,
+                accounts,
+                &[
+                    &[b"1"],
+                    &[b"2"],
+                    &[b"3"],
+                    &[b"4"],
+                    &[b"5"],
+                    &[b"6"],
+                    &[b"7"],
+                    &[b"8"],
+                    &[b"9"],
+                    &[b"0"],
+                    &[b"1"],
+                    &[b"2"],
+                    &[b"3"],
+                    &[b"4"],
+                    &[b"5"],
+                    &[b"6"],
+                    &[b"7"],
+                ],
+            )?;
+        }
+        TEST_ALLOC_ACCESS_VIOLATION => {
+            msg!("Test resize violation");
+            let pubkey = *accounts[FROM_INDEX].key;
+            let owner = *accounts[FROM_INDEX].owner;
+            let ptr = accounts[FROM_INDEX].data.borrow().as_ptr() as u64 as *mut _;
+            let len = accounts[FROM_INDEX].data_len();
+            let mut data = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            let mut lamports = accounts[FROM_INDEX].lamports();
+            let from_info = AccountInfo::new(
+                &pubkey,
+                false,
+                true,
+                &mut lamports,
+                &mut data,
+                &owner,
+                false,
+                0,
+            );
+
+            let pubkey = *accounts[DERIVED_KEY1_INDEX].key;
+            let owner = *accounts[DERIVED_KEY1_INDEX].owner;
+            // Point to top edge of heap, attempt to allocate into unprivileged memory
+            let mut data = unsafe { std::slice::from_raw_parts_mut(0x300007ff8 as *mut _, 0) };
+            let mut lamports = accounts[DERIVED_KEY1_INDEX].lamports();
+            let derived_info = AccountInfo::new(
+                &pubkey,
+                false,
+                true,
+                &mut lamports,
+                &mut data,
+                &owner,
+                false,
+                0,
+            );
+
+            let pubkey = *accounts[SYSTEM_PROGRAM_INDEX].key;
+            let owner = *accounts[SYSTEM_PROGRAM_INDEX].owner;
+            let ptr = accounts[SYSTEM_PROGRAM_INDEX].data.borrow().as_ptr() as u64 as *mut _;
+            let len = accounts[SYSTEM_PROGRAM_INDEX].data_len();
+            let mut data = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            let mut lamports = accounts[SYSTEM_PROGRAM_INDEX].lamports();
+            let system_info = AccountInfo::new(
+                &pubkey,
+                false,
+                false,
+                &mut lamports,
+                &mut data,
+                &owner,
+                true,
+                0,
+            );
+
+            let instruction = system_instruction::create_account(
+                accounts[FROM_INDEX].key,
+                accounts[DERIVED_KEY1_INDEX].key,
+                42,
+                MAX_PERMITTED_DATA_INCREASE as u64,
+                program_id,
+            );
+
+            invoke_signed(
+                &instruction,
+                &[system_info.clone(), from_info.clone(), derived_info.clone()],
+                &[&[b"You pass butter", &[bump_seed1]]],
+            )?;
         }
         _ => panic!(),
     }

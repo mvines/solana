@@ -1,4 +1,5 @@
 //! The `retransmit_stage` retransmits shreds between validators
+#![allow(clippy::rc_buffer)]
 
 use crate::{
     cluster_info::{compute_retransmit_peers, ClusterInfo, DATA_PLANE_FANOUT},
@@ -13,14 +14,15 @@ use crate::{
     window_service::{should_retransmit_and_persist, WindowService},
 };
 use crossbeam_channel::Receiver;
+use lru::LruCache;
+use solana_ledger::shred::{get_shred_slot_index_type, ShredFetchStats};
 use solana_ledger::{
     blockstore::{Blockstore, CompletedSlotsReceiver},
     leader_schedule_cache::LeaderScheduleCache,
-    staking_utils,
 };
 use solana_measure::measure::Measure;
 use solana_metrics::inc_new_counter_error;
-use solana_perf::packet::Packets;
+use solana_perf::packet::{Packet, Packets};
 use solana_runtime::bank_forks::BankForks;
 use solana_sdk::clock::{Epoch, Slot};
 use solana_sdk::epoch_schedule::EpochSchedule;
@@ -40,6 +42,9 @@ use std::{
     thread::{self, Builder, JoinHandle},
     time::Duration,
 };
+
+const MAX_DUPLICATE_COUNT: usize = 2;
+const DEFAULT_LRU_SIZE: usize = 10_000;
 
 // Limit a given thread to consume about this many packets so that
 // it doesn't pull up too much work.
@@ -196,6 +201,44 @@ struct EpochStakesCache {
     stakes_and_index: Vec<(u64, usize)>,
 }
 
+use crate::packet_hasher::PacketHasher;
+// Map of shred (slot, index, is_data) => list of hash values seen for that key.
+pub type ShredFilter = LruCache<(Slot, u32, bool), Vec<u64>>;
+
+pub type ShredFilterAndHasher = (ShredFilter, PacketHasher);
+
+// Return true if shred is already received and should skip retransmit
+fn check_if_already_received(
+    packet: &Packet,
+    shreds_received: &Arc<Mutex<ShredFilterAndHasher>>,
+) -> bool {
+    match get_shred_slot_index_type(packet, &mut ShredFetchStats::default()) {
+        Some(slot_index) => {
+            let mut received = shreds_received.lock().unwrap();
+            let hasher = received.1.clone();
+            if let Some(sent) = received.0.get_mut(&slot_index) {
+                if sent.len() < MAX_DUPLICATE_COUNT {
+                    let hash = hasher.hash_packet(packet);
+                    if sent.contains(&hash) {
+                        return true;
+                    }
+
+                    sent.push(hash);
+                } else {
+                    return true;
+                }
+            } else {
+                let hash = hasher.hash_packet(&packet);
+                received.0.put(slot_index, vec![hash]);
+            }
+
+            false
+        }
+        None => true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn retransmit(
     bank_forks: &Arc<RwLock<BankForks>>,
     leader_schedule_cache: &Arc<LeaderScheduleCache>,
@@ -206,6 +249,7 @@ fn retransmit(
     stats: &Arc<RetransmitStats>,
     epoch_stakes_cache: &Arc<RwLock<EpochStakesCache>>,
     last_peer_update: &Arc<AtomicU64>,
+    shreds_received: &Arc<Mutex<ShredFilterAndHasher>>,
 ) -> Result<()> {
     let timer = Duration::new(1, 0);
     let r_lock = r.lock().unwrap();
@@ -233,7 +277,7 @@ fn retransmit(
         drop(r_epoch_stakes_cache);
         let mut w_epoch_stakes_cache = epoch_stakes_cache.write().unwrap();
         if w_epoch_stakes_cache.epoch != bank_epoch {
-            let stakes = staking_utils::staked_nodes_at_epoch(&r_bank, bank_epoch);
+            let stakes = r_bank.epoch_staked_nodes(bank_epoch);
             let stakes = stakes.map(Arc::new);
             w_epoch_stakes_cache.stakes = stakes;
             w_epoch_stakes_cache.epoch = bank_epoch;
@@ -254,6 +298,11 @@ fn retransmit(
         w_epoch_stakes_cache.stakes_and_index = stakes_and_index;
         drop(w_epoch_stakes_cache);
         r_epoch_stakes_cache = epoch_stakes_cache.read().unwrap();
+        {
+            let mut sr = shreds_received.lock().unwrap();
+            sr.0.clear();
+            sr.1.reset();
+        }
     }
     let mut peers_len = 0;
     epoch_cache_update.stop();
@@ -276,6 +325,10 @@ fn retransmit(
             if packet.meta.repair {
                 total_packets -= 1;
                 repair_total += 1;
+                continue;
+            }
+
+            if check_if_already_received(packet, shreds_received) {
                 continue;
             }
 
@@ -367,6 +420,10 @@ pub fn retransmitter(
     r: Arc<Mutex<PacketReceiver>>,
 ) -> Vec<JoinHandle<()>> {
     let stats = Arc::new(RetransmitStats::default());
+    let shreds_received = Arc::new(Mutex::new((
+        LruCache::new(DEFAULT_LRU_SIZE),
+        PacketHasher::default(),
+    )));
     (0..sockets.len())
         .map(|s| {
             let sockets = sockets.clone();
@@ -377,6 +434,7 @@ pub fn retransmitter(
             let stats = stats.clone();
             let epoch_stakes_cache = Arc::new(RwLock::new(EpochStakesCache::default()));
             let last_peer_update = Arc::new(AtomicU64::new(0));
+            let shreds_received = shreds_received.clone();
 
             Builder::new()
                 .name("solana-retransmitter".to_string())
@@ -393,6 +451,7 @@ pub fn retransmitter(
                             &stats,
                             &epoch_stakes_cache,
                             &last_peer_update,
+                            &shreds_received,
                         ) {
                             match e {
                                 Error::RecvTimeoutError(RecvTimeoutError::Disconnected) => break,
@@ -518,12 +577,14 @@ mod tests {
     use solana_ledger::blockstore_processor::{process_blockstore, ProcessOptions};
     use solana_ledger::create_new_tmp_ledger;
     use solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo};
+    use solana_ledger::shred::Shred;
     use solana_net_utils::find_available_port_in_range;
-    use solana_perf::packet::{Meta, Packet, Packets};
+    use solana_perf::packet::{Packet, Packets};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn test_skip_repair() {
+        solana_logger::setup();
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(123);
         let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
         let blockstore = Blockstore::open(&ledger_path).unwrap();
@@ -565,7 +626,11 @@ mod tests {
         );
         let _thread_hdls = vec![t_retransmit];
 
-        let packets = Packets::new(vec![Packet::default()]);
+        let mut shred = Shred::new_from_data(0, 0, 0, None, true, true, 0, 0x20, 0);
+        let mut packet = Packet::default();
+        shred.copy_to_packet(&mut packet);
+
+        let packets = Packets::new(vec![packet.clone()]);
         // it should send this over the sockets.
         retransmit_sender.send(packets).unwrap();
         let mut packets = Packets::new(vec![]);
@@ -573,20 +638,65 @@ mod tests {
         assert_eq!(packets.packets.len(), 1);
         assert_eq!(packets.packets[0].meta.repair, false);
 
-        let repair = Packet {
-            meta: Meta {
-                repair: true,
-                ..Meta::default()
-            },
-            ..Packet::default()
-        };
+        let mut repair = packet.clone();
+        repair.meta.repair = true;
 
+        shred.set_slot(1);
+        shred.copy_to_packet(&mut packet);
         // send 1 repair and 1 "regular" packet so that we don't block forever on the recv_from
-        let packets = Packets::new(vec![repair, Packet::default()]);
+        let packets = Packets::new(vec![repair, packet]);
         retransmit_sender.send(packets).unwrap();
         let mut packets = Packets::new(vec![]);
         solana_streamer::packet::recv_from(&mut packets, &me_retransmit, 1).unwrap();
         assert_eq!(packets.packets.len(), 1);
         assert_eq!(packets.packets[0].meta.repair, false);
+    }
+
+    #[test]
+    fn test_already_received() {
+        let mut packet = Packet::default();
+        let slot = 1;
+        let index = 5;
+        let version = 0x40;
+        let shred = Shred::new_from_data(slot, index, 0, None, true, true, 0, version, 0);
+        shred.copy_to_packet(&mut packet);
+        let shreds_received = Arc::new(Mutex::new((LruCache::new(100), PacketHasher::default())));
+        // unique shred for (1, 5) should pass
+        assert!(!check_if_already_received(&packet, &shreds_received));
+        // duplicate shred for (1, 5) blocked
+        assert!(check_if_already_received(&packet, &shreds_received));
+
+        let shred = Shred::new_from_data(slot, index, 2, None, true, true, 0, version, 0);
+        shred.copy_to_packet(&mut packet);
+        // first duplicate shred for (1, 5) passed
+        assert!(!check_if_already_received(&packet, &shreds_received));
+        // then blocked
+        assert!(check_if_already_received(&packet, &shreds_received));
+
+        let shred = Shred::new_from_data(slot, index, 8, None, true, true, 0, version, 0);
+        shred.copy_to_packet(&mut packet);
+        // 2nd duplicate shred for (1, 5) blocked
+        assert!(check_if_already_received(&packet, &shreds_received));
+        assert!(check_if_already_received(&packet, &shreds_received));
+
+        let shred = Shred::new_empty_coding(slot, index, 0, 1, 1, 0, version);
+        shred.copy_to_packet(&mut packet);
+        // Coding at (1, 5) passes
+        assert!(!check_if_already_received(&packet, &shreds_received));
+        // then blocked
+        assert!(check_if_already_received(&packet, &shreds_received));
+
+        let shred = Shred::new_empty_coding(slot, index, 2, 1, 1, 0, version);
+        shred.copy_to_packet(&mut packet);
+        // 2nd unique coding at (1, 5) passes
+        assert!(!check_if_already_received(&packet, &shreds_received));
+        // same again is blocked
+        assert!(check_if_already_received(&packet, &shreds_received));
+
+        let shred = Shred::new_empty_coding(slot, index, 3, 1, 1, 0, version);
+        shred.copy_to_packet(&mut packet);
+        // Another unique coding at (1, 5) always blocked
+        assert!(check_if_already_received(&packet, &shreds_received));
+        assert!(check_if_already_received(&packet, &shreds_received));
     }
 }

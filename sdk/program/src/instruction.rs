@@ -167,6 +167,19 @@ pub enum InstructionError {
     /// Computational budget exceeded
     #[error("Computational budget exceeded")]
     ComputationalBudgetExceeded,
+
+    /// Cross-program invocation with unauthorized signer or writable account
+    #[error("Cross-program invocation with unauthorized signer or writable account")]
+    PrivilegeEscalation,
+
+    #[error("Failed to create program execution environment")]
+    ProgramEnvironmentSetupFailure,
+
+    #[error("Program failed to complete")]
+    ProgramFailedToComplete,
+
+    #[error("Program failed to compile")]
+    ProgramFailedToCompile,
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]

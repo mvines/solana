@@ -36,6 +36,10 @@ use solana_sdk::{
     timing::duration_as_ms,
     transaction::{Result, Transaction, TransactionError},
 };
+use solana_transaction_status::token_balances::{
+    collect_token_balances, TransactionTokenBalancesSet,
+};
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -102,6 +106,16 @@ fn execute_batch(
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
 ) -> Result<()> {
+    let record_token_balances = transaction_status_sender.is_some();
+
+    let mut mint_decimals: HashMap<Pubkey, u8> = HashMap::new();
+
+    let pre_token_balances = if record_token_balances {
+        collect_token_balances(&bank, &batch, &mut mint_decimals)
+    } else {
+        vec![]
+    };
+
     let (tx_results, balances, inner_instructions, transaction_logs) =
         batch.bank().load_execute_and_commit_transactions(
             batch,
@@ -120,12 +134,22 @@ fn execute_batch(
     } = tx_results;
 
     if let Some(sender) = transaction_status_sender {
+        let post_token_balances = if record_token_balances {
+            collect_token_balances(&bank, &batch, &mut mint_decimals)
+        } else {
+            vec![]
+        };
+
+        let token_balances =
+            TransactionTokenBalancesSet::new(pre_token_balances, post_token_balances);
+
         send_transaction_status_batch(
             bank.clone(),
             batch.transactions(),
             batch.iteration_order_vec(),
             execution_results,
             balances,
+            token_balances,
             inner_instructions,
             transaction_logs,
             sender,
@@ -311,6 +335,7 @@ pub type ProcessCallback = Arc<dyn Fn(&Bank) + Sync + Send>;
 
 #[derive(Default, Clone)]
 pub struct ProcessOptions {
+    pub bpf_jit: bool,
     pub poh_verify: bool,
     pub full_leader_cache: bool,
     pub dev_halt_at_slot: Option<Slot>,
@@ -342,12 +367,12 @@ pub fn process_blockstore(
         account_paths,
         &opts.frozen_accounts,
         opts.debug_keys.clone(),
-        Some(&crate::builtins::get(genesis_config.cluster_type)),
+        Some(&crate::builtins::get(opts.bpf_jit)),
     );
     let bank0 = Arc::new(bank0);
     info!("processing ledger for slot 0...");
     let recyclers = VerifyRecyclers::default();
-    process_bank_0(&bank0, blockstore, &opts, &recyclers)?;
+    process_bank_0(&bank0, blockstore, &opts, &recyclers);
     do_process_blockstore_from_root(blockstore, bank0, &opts, &recyclers, None)
 }
 
@@ -710,7 +735,7 @@ fn process_bank_0(
     blockstore: &Blockstore,
     opts: &ProcessOptions,
     recyclers: &VerifyRecyclers,
-) -> result::Result<(), BlockstoreProcessorError> {
+) {
     assert_eq!(bank0.slot(), 0);
     let mut progress = ConfirmationProgress::new(bank0.last_blockhash());
     confirm_full_slot(
@@ -724,7 +749,6 @@ fn process_bank_0(
     )
     .expect("processing for bank 0 must succeed");
     bank0.freeze();
-    Ok(())
 }
 
 // Given a bank, add its children to the pending slots queue if those children slots are
@@ -820,118 +844,121 @@ fn load_frozen_forks(
     )?;
 
     let dev_halt_at_slot = opts.dev_halt_at_slot.unwrap_or(std::u64::MAX);
-    while !pending_slots.is_empty() {
-        let (meta, bank, last_entry_hash) = pending_slots.pop().unwrap();
-        let slot = bank.slot();
-        if last_status_report.elapsed() > Duration::from_secs(2) {
-            let secs = last_status_report.elapsed().as_secs() as f32;
-            last_status_report = Instant::now();
-            info!(
-                "processing ledger: slot={}, last root slot={} slots={} slots/s={:?} txs/s={}",
+    if root_bank.slot() != dev_halt_at_slot {
+        while !pending_slots.is_empty() {
+            let (meta, bank, last_entry_hash) = pending_slots.pop().unwrap();
+            let slot = bank.slot();
+            if last_status_report.elapsed() > Duration::from_secs(2) {
+                let secs = last_status_report.elapsed().as_secs() as f32;
+                last_status_report = Instant::now();
+                info!(
+                    "processing ledger: slot={}, last root slot={} slots={} slots/s={:?} txs/s={}",
+                    slot,
+                    last_root_slot,
+                    slots_elapsed,
+                    slots_elapsed as f32 / secs,
+                    txs as f32 / secs,
+                );
+                slots_elapsed = 0;
+                txs = 0;
+            }
+
+            let allocated = thread_mem_usage::Allocatedp::default();
+            let initial_allocation = allocated.get();
+
+            let mut progress = ConfirmationProgress::new(last_entry_hash);
+
+            if process_single_slot(
+                blockstore,
+                &bank,
+                opts,
+                recyclers,
+                &mut progress,
+                transaction_status_sender.clone(),
+                None,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            txs += progress.num_txs;
+
+            // Block must be frozen by this point, otherwise `process_single_slot` would
+            // have errored above
+            assert!(bank.is_frozen());
+            all_banks.insert(bank.slot(), bank.clone());
+
+            // If we've reached the last known root in blockstore, start looking
+            // for newer cluster confirmed roots
+            let new_root_bank = {
+                if *root == max_root {
+                    supermajority_root_from_vote_accounts(
+                        bank.slot(),
+                        bank.total_epoch_stake(),
+                        bank.vote_accounts(),
+                    ).and_then(|supermajority_root| {
+                        if supermajority_root > *root {
+                            // If there's a cluster confirmed root greater than our last
+                            // replayed root, then beccause the cluster confirmed root should
+                            // be descended from our last root, it must exist in `all_banks`
+                            let cluster_root_bank = all_banks.get(&supermajority_root).unwrap();
+
+                            // cluster root must be a descendant of our root, otherwise something
+                            // is drastically wrong
+                            assert!(cluster_root_bank.ancestors.contains_key(root));
+                            info!("blockstore processor found new cluster confirmed root: {}, observed in bank: {}", cluster_root_bank.slot(), bank.slot());
+                            Some(cluster_root_bank)
+                        } else {
+                            None
+                        }
+                    })
+                } else if blockstore.is_root(slot) {
+                    Some(&bank)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(new_root_bank) = new_root_bank {
+                *root = new_root_bank.slot();
+                last_root_slot = new_root_bank.slot();
+                leader_schedule_cache.set_root(&new_root_bank);
+                new_root_bank.squash();
+
+                if last_free.elapsed() > Duration::from_secs(10) {
+                    // This could take few secs; so update last_free later
+                    new_root_bank.exhaustively_free_unused_resource();
+                    last_free = Instant::now();
+                }
+
+                // Filter out all non descendants of the new root
+                pending_slots
+                    .retain(|(_, pending_bank, _)| pending_bank.ancestors.contains_key(root));
+                initial_forks.retain(|_, fork_tip_bank| fork_tip_bank.ancestors.contains_key(root));
+                all_banks.retain(|_, bank| bank.ancestors.contains_key(root));
+            }
+
+            slots_elapsed += 1;
+
+            trace!(
+                "Bank for {}slot {} is complete. {} bytes allocated",
+                if last_root_slot == slot { "root " } else { "" },
                 slot,
-                last_root_slot,
-                slots_elapsed,
-                slots_elapsed as f32 / secs,
-                txs as f32 / secs,
+                allocated.since(initial_allocation)
             );
-            slots_elapsed = 0;
-            txs = 0;
-        }
 
-        let allocated = thread_mem_usage::Allocatedp::default();
-        let initial_allocation = allocated.get();
+            process_next_slots(
+                &bank,
+                &meta,
+                blockstore,
+                leader_schedule_cache,
+                &mut pending_slots,
+                &mut initial_forks,
+            )?;
 
-        let mut progress = ConfirmationProgress::new(last_entry_hash);
-
-        if process_single_slot(
-            blockstore,
-            &bank,
-            opts,
-            recyclers,
-            &mut progress,
-            transaction_status_sender.clone(),
-            None,
-        )
-        .is_err()
-        {
-            continue;
-        }
-        txs += progress.num_txs;
-
-        // Block must be frozen by this point, otherwise `process_single_slot` would
-        // have errored above
-        assert!(bank.is_frozen());
-        all_banks.insert(bank.slot(), bank.clone());
-
-        // If we've reached the last known root in blockstore, start looking
-        // for newer cluster confirmed roots
-        let new_root_bank = {
-            if *root == max_root {
-                supermajority_root_from_vote_accounts(
-                    bank.slot(),
-                    bank.total_epoch_stake(),
-                    bank.vote_accounts(),
-                ).and_then(|supermajority_root| {
-                    if supermajority_root > *root {
-                        // If there's a cluster confirmed root greater than our last
-                        // replayed root, then beccause the cluster confirmed root should
-                        // be descended from our last root, it must exist in `all_banks`
-                        let cluster_root_bank = all_banks.get(&supermajority_root).unwrap();
-
-                        // cluster root must be a descendant of our root, otherwise something
-                        // is drastically wrong
-                        assert!(cluster_root_bank.ancestors.contains_key(root));
-                        info!("blockstore processor found new cluster confirmed root: {}, observed in bank: {}", cluster_root_bank.slot(), bank.slot());
-                        Some(cluster_root_bank)
-                    } else {
-                        None
-                    }
-                })
-            } else if blockstore.is_root(slot) {
-                Some(&bank)
-            } else {
-                None
+            if slot >= dev_halt_at_slot {
+                break;
             }
-        };
-
-        if let Some(new_root_bank) = new_root_bank {
-            *root = new_root_bank.slot();
-            last_root_slot = new_root_bank.slot();
-            leader_schedule_cache.set_root(&new_root_bank);
-            new_root_bank.squash();
-
-            if last_free.elapsed() > Duration::from_secs(30) {
-                // This could take few secs; so update last_free later
-                new_root_bank.exhaustively_free_unused_resource();
-                last_free = Instant::now();
-            }
-
-            // Filter out all non descendants of the new root
-            pending_slots.retain(|(_, pending_bank, _)| pending_bank.ancestors.contains_key(root));
-            initial_forks.retain(|_, fork_tip_bank| fork_tip_bank.ancestors.contains_key(root));
-            all_banks.retain(|_, bank| bank.ancestors.contains_key(root));
-        }
-
-        slots_elapsed += 1;
-
-        trace!(
-            "Bank for {}slot {} is complete. {} bytes allocated",
-            if last_root_slot == slot { "root " } else { "" },
-            slot,
-            allocated.since(initial_allocation)
-        );
-
-        process_next_slots(
-            &bank,
-            &meta,
-            blockstore,
-            leader_schedule_cache,
-            &mut pending_slots,
-            &mut initial_forks,
-        )?;
-
-        if slot >= dev_halt_at_slot {
-            break;
         }
     }
 
@@ -1031,6 +1058,7 @@ pub struct TransactionStatusBatch {
     pub iteration_order: Option<Vec<usize>>,
     pub statuses: Vec<TransactionExecutionResult>,
     pub balances: TransactionBalancesSet,
+    pub token_balances: TransactionTokenBalancesSet,
     pub inner_instructions: Vec<Option<InnerInstructionsList>>,
     pub transaction_logs: Vec<TransactionLogMessages>,
 }
@@ -1043,6 +1071,7 @@ pub fn send_transaction_status_batch(
     iteration_order: Option<Vec<usize>>,
     statuses: Vec<TransactionExecutionResult>,
     balances: TransactionBalancesSet,
+    token_balances: TransactionTokenBalancesSet,
     inner_instructions: Vec<Option<InnerInstructionsList>>,
     transaction_logs: Vec<TransactionLogMessages>,
     transaction_status_sender: TransactionStatusSender,
@@ -1054,6 +1083,7 @@ pub fn send_transaction_status_batch(
         iteration_order,
         statuses,
         balances,
+        token_balances,
         inner_instructions,
         transaction_logs,
     }) {
@@ -2608,6 +2638,37 @@ pub mod tests {
     }
 
     #[test]
+    fn test_halt_at_slot_starting_snapshot_root() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(123);
+
+        // Create roots at slots 0, 1
+        let forks = tr(0) / tr(1);
+        let ledger_path = get_tmp_ledger_path!();
+        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        blockstore.add_tree(
+            forks,
+            false,
+            true,
+            genesis_config.ticks_per_slot,
+            genesis_config.hash(),
+        );
+        blockstore.set_roots(&[0, 1]).unwrap();
+
+        // Specify halting at slot 0
+        let opts = ProcessOptions {
+            poh_verify: true,
+            dev_halt_at_slot: Some(0),
+            ..ProcessOptions::default()
+        };
+        let (bank_forks, _leader_schedule) =
+            process_blockstore(&genesis_config, &blockstore, Vec::new(), opts).unwrap();
+
+        // Should be able to fetch slot 0 because we specified halting at slot 0, even
+        // if there is a greater root at slot 1.
+        assert!(bank_forks.get(0).is_some());
+    }
+
+    #[test]
     fn test_process_blockstore_from_root() {
         let GenesisConfigInfo {
             mut genesis_config, ..
@@ -2650,7 +2711,7 @@ pub mod tests {
             ..ProcessOptions::default()
         };
         let recyclers = VerifyRecyclers::default();
-        process_bank_0(&bank0, &blockstore, &opts, &recyclers).unwrap();
+        process_bank_0(&bank0, &blockstore, &opts, &recyclers);
         let bank1 = Arc::new(Bank::new_from_parent(&bank0, &Pubkey::default(), 1));
         confirm_full_slot(
             &blockstore,
@@ -2836,7 +2897,7 @@ pub mod tests {
 
     fn frozen_bank_slots(bank_forks: &BankForks) -> Vec<Slot> {
         let mut slots: Vec<_> = bank_forks.frozen_banks().keys().cloned().collect();
-        slots.sort();
+        slots.sort_unstable();
         slots
     }
 
@@ -3145,6 +3206,7 @@ pub mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_supermajority_root_from_vote_accounts() {
         let convert_to_vote_accounts =
             |roots_stakes: Vec<(Slot, u64)>| -> Vec<(Pubkey, (u64, ArcVoteAccount))> {

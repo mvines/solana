@@ -276,6 +276,7 @@ const GetInflationGovernorResult = struct({
  * @property {number} slotsInEpoch
  * @property {number} absoluteSlot
  * @property {number} blockHeight
+ * @property {number} transactionCount
  */
 type EpochInfo = {
   epoch: number,
@@ -283,6 +284,7 @@ type EpochInfo = {
   slotsInEpoch: number,
   absoluteSlot: number,
   blockHeight: number | null,
+  transactionCount: number | null,
 };
 
 const GetEpochInfoResult = struct({
@@ -291,6 +293,7 @@ const GetEpochInfoResult = struct({
   slotsInEpoch: 'number',
   absoluteSlot: 'number',
   blockHeight: 'number?',
+  transactionCount: 'number?',
 });
 
 /**
@@ -368,14 +371,15 @@ const SimulatedTransactionResponseValidator = jsonRpcResultAndContext(
   }),
 );
 
-type PartiallyDecodedInnerInstruction = {
-  index: number,
-  instructions: PartiallyDecodedInstruction[],
-};
-
 type ParsedInnerInstruction = {
   index: number,
-  instructions: (ParsedInstruction | PartiallyDecodedInnerInstruction)[],
+  instructions: (ParsedInstruction | PartiallyDecodedInstruction)[],
+};
+
+type TokenBalance = {
+  accountIndex: number,
+  mint: string,
+  uiTokenAmount: TokenAmount,
 };
 
 /**
@@ -387,6 +391,8 @@ type ParsedInnerInstruction = {
  * @property {Array<number>} preBalances The balances of the transaction accounts before processing
  * @property {Array<number>} postBalances The balances of the transaction accounts after processing
  * @property {Array<string>} logMessages An array of program log messages emitted during a transaction
+ * @property {Array<TokenBalance>} preTokenBalances The token balances of the transaction accounts before processing
+ * @property {Array<TokenBalance>} postTokenBalances The token balances of the transaction accounts after processing
  * @property {object|null} err The error result of transaction processing
  */
 type ParsedConfirmedTransactionMeta = {
@@ -395,6 +401,8 @@ type ParsedConfirmedTransactionMeta = {
   preBalances: Array<number>,
   postBalances: Array<number>,
   logMessages?: Array<string>,
+  preTokenBalances?: Array<TokenBalance>,
+  postTokenBalances?: Array<TokenBalance>,
   err: TransactionError | null,
 };
 
@@ -1183,6 +1191,36 @@ const ConfirmedTransactionMetaResult = struct.union([
     preBalances: struct.array(['number']),
     postBalances: struct.array(['number']),
     logMessages: struct.union([struct.array(['string']), 'null', 'undefined']),
+    preTokenBalances: struct.union([
+      struct.array([
+        struct.pick({
+          accountIndex: 'number',
+          mint: 'string',
+          uiTokenAmount: struct.pick({
+            amount: 'string',
+            decimals: 'number',
+            uiAmount: 'number',
+          }),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
+    postTokenBalances: struct.union([
+      struct.array([
+        struct.pick({
+          accountIndex: 'number',
+          mint: 'string',
+          uiTokenAmount: struct.pick({
+            amount: 'string',
+            decimals: 'number',
+            uiAmount: 'number',
+          }),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
   }),
 ]);
 /**
@@ -1219,6 +1257,36 @@ const ParsedConfirmedTransactionMetaResult = struct.union([
     preBalances: struct.array(['number']),
     postBalances: struct.array(['number']),
     logMessages: struct.union([struct.array(['string']), 'null', 'undefined']),
+    preTokenBalances: struct.union([
+      struct.array([
+        struct.pick({
+          accountIndex: 'number',
+          mint: 'string',
+          uiTokenAmount: struct.pick({
+            amount: 'string',
+            decimals: 'number',
+            uiAmount: 'number',
+          }),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
+    postTokenBalances: struct.union([
+      struct.array([
+        struct.pick({
+          accountIndex: 'number',
+          mint: 'string',
+          uiTokenAmount: struct.pick({
+            amount: 'string',
+            decimals: 'number',
+            uiAmount: 'number',
+          }),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
   }),
 ]);
 
@@ -2601,6 +2669,18 @@ export class Connection {
     }
     assert(typeof result !== 'undefined');
     if (result === null) return result;
+
+    if (result.meta.innerInstructions) {
+      result.meta.innerInstructions.forEach(inner => {
+        inner.instructions.forEach(ix => {
+          ix.programId = new PublicKey(ix.programId);
+
+          if (ix.accounts) {
+            ix.accounts = ix.accounts.map(account => new PublicKey(account));
+          }
+        });
+      });
+    }
 
     const {
       accountKeys,

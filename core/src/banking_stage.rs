@@ -15,7 +15,7 @@ use solana_ledger::{
     leader_schedule_cache::LeaderScheduleCache,
 };
 use solana_measure::{measure::Measure, thread_mem_usage};
-use solana_metrics::{inc_new_counter_debug, inc_new_counter_info, inc_new_counter_warn};
+use solana_metrics::{inc_new_counter_debug, inc_new_counter_info};
 use solana_perf::{
     cuda_runtime::PinnedVec,
     packet::{limited_deserialize, Packet, Packets, PACKETS_PER_BATCH},
@@ -38,8 +38,13 @@ use solana_sdk::{
     timing::{duration_as_ms, timestamp},
     transaction::{self, Transaction, TransactionError},
 };
+use solana_transaction_status::token_balances::{
+    collect_token_balances, TransactionTokenBalancesSet,
+};
 use std::{
-    cmp, env,
+    cmp,
+    collections::HashMap,
+    env,
     net::UdpSocket,
     sync::atomic::AtomicBool,
     sync::mpsc::Receiver,
@@ -53,7 +58,7 @@ type PacketsAndOffsets = (Packets, Vec<usize>);
 pub type UnprocessedPackets = Vec<PacketsAndOffsets>;
 
 /// Transaction forwarding
-pub const FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET: u64 = 1;
+pub const FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET: u64 = 2;
 
 // Fixed thread size seems to be fastest on GCP setup
 pub const NUM_THREADS: u32 = 4;
@@ -482,7 +487,7 @@ impl BankingStage {
         debug!("num_to_commit: {} ", num_to_commit);
         // unlock all the accounts with errors which are filtered by the above `filter_map`
         if !processed_transactions.is_empty() {
-            inc_new_counter_warn!("banking_stage-record_transactions", num_to_commit);
+            inc_new_counter_info!("banking_stage-record_transactions", num_to_commit);
 
             let mut hash_time = Measure::start("record::hash");
             let hash = hash_transactions(&processed_transactions[..]);
@@ -530,6 +535,15 @@ impl BankingStage {
         } else {
             vec![]
         };
+
+        let mut mint_decimals: HashMap<Pubkey, u8> = HashMap::new();
+
+        let pre_token_balances = if transaction_status_sender.is_some() {
+            collect_token_balances(&bank, &batch, &mut mint_decimals)
+        } else {
+            vec![]
+        };
+
         let (
             mut loaded_accounts,
             results,
@@ -574,12 +588,14 @@ impl BankingStage {
             bank_utils::find_and_send_votes(txs, &tx_results, Some(gossip_vote_sender));
             if let Some(sender) = transaction_status_sender {
                 let post_balances = bank.collect_balances(batch);
+                let post_token_balances = collect_token_balances(&bank, &batch, &mut mint_decimals);
                 send_transaction_status_batch(
                     bank.clone(),
                     batch.transactions(),
                     batch.iteration_order_vec(),
                     tx_results.execution_results,
                     TransactionBalancesSet::new(pre_balances, post_balances),
+                    TransactionTokenBalancesSet::new(pre_token_balances, post_token_balances),
                     inner_instructions,
                     transaction_logs,
                     sender,
@@ -1155,8 +1171,10 @@ mod tests {
                 Blockstore::open(&ledger_path)
                     .expect("Expected to be able to open database ledger"),
             );
-            let mut poh_config = PohConfig::default();
-            poh_config.target_tick_count = Some(bank.max_tick_height() + num_extra_ticks);
+            let poh_config = PohConfig {
+                target_tick_count: Some(bank.max_tick_height() + num_extra_ticks),
+                ..PohConfig::default()
+            };
             let (exit, poh_recorder, poh_service, entry_receiver) =
                 create_test_recorder(&bank, &blockstore, Some(poh_config));
             let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
@@ -1220,9 +1238,12 @@ mod tests {
                 Blockstore::open(&ledger_path)
                     .expect("Expected to be able to open database ledger"),
             );
-            let mut poh_config = PohConfig::default();
-            // limit tick count to avoid clearing working_bank at PohRecord then PohRecorderError(MaxHeightReached) at BankingStage
-            poh_config.target_tick_count = Some(bank.max_tick_height() - 1);
+            let poh_config = PohConfig {
+                // limit tick count to avoid clearing working_bank at PohRecord then
+                // PohRecorderError(MaxHeightReached) at BankingStage
+                target_tick_count: Some(bank.max_tick_height() - 1),
+                ..PohConfig::default()
+            };
             let (exit, poh_recorder, poh_service, entry_receiver) =
                 create_test_recorder(&bank, &blockstore, Some(poh_config));
             let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
@@ -1365,9 +1386,12 @@ mod tests {
                     Blockstore::open(&ledger_path)
                         .expect("Expected to be able to open database ledger"),
                 );
-                let mut poh_config = PohConfig::default();
-                // limit tick count to avoid clearing working_bank at PohRecord then PohRecorderError(MaxHeightReached) at BankingStage
-                poh_config.target_tick_count = Some(bank.max_tick_height() - 1);
+                let poh_config = PohConfig {
+                    // limit tick count to avoid clearing working_bank at
+                    // PohRecord then PohRecorderError(MaxHeightReached) at BankingStage
+                    target_tick_count: Some(bank.max_tick_height() - 1),
+                    ..PohConfig::default()
+                };
                 let (exit, poh_recorder, poh_service, entry_receiver) =
                     create_test_recorder(&bank, &blockstore, Some(poh_config));
                 let cluster_info =
@@ -1957,7 +1981,7 @@ mod tests {
 
             assert_eq!(processed_transactions_count, 0,);
 
-            retryable_txs.sort();
+            retryable_txs.sort_unstable();
             let expected: Vec<usize> = (0..transactions.len()).collect();
             assert_eq!(retryable_txs, expected);
         }

@@ -44,7 +44,6 @@ use std::{
     collections::{HashMap, HashSet},
     convert::TryInto,
     io::{Error as IOError, Result as IOResult},
-    iter::FromIterator,
     ops::RangeBounds,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -266,6 +265,14 @@ impl AccountStorageEntry {
         self.approx_store_count.load(Ordering::Relaxed)
     }
 
+    pub fn written_bytes(&self) -> u64 {
+        self.accounts.len() as u64
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.accounts.capacity()
+    }
+
     pub fn has_accounts(&self) -> bool {
         self.count() > 0
     }
@@ -435,6 +442,8 @@ pub struct AccountsDB {
     /// Set of storage paths to pick from
     pub(crate) paths: Vec<PathBuf>,
 
+    pub shrink_paths: RwLock<Option<Vec<PathBuf>>>,
+
     /// Directory of paths this accounts_db needs to hold/remove
     temp_paths: Option<Vec<TempDir>>,
 
@@ -522,6 +531,7 @@ impl Default for AccountsDB {
             shrink_candidate_slots: Mutex::new(Vec::new()),
             write_version: AtomicU64::new(0),
             paths: vec![],
+            shrink_paths: RwLock::new(None),
             temp_paths: None,
             file_size: DEFAULT_FILE_SIZE,
             thread_pool: rayon::ThreadPoolBuilder::new()
@@ -565,6 +575,15 @@ impl AccountsDB {
             }
         }
         new
+    }
+
+    pub fn set_shrink_paths(&self, paths: Vec<PathBuf>) {
+        assert!(!paths.is_empty());
+        let mut shrink_paths = self.shrink_paths.write().unwrap();
+        for path in &paths {
+            std::fs::create_dir_all(path).expect("Create directory failed.");
+        }
+        *shrink_paths = Some(paths);
     }
 
     pub fn file_size(&self) -> u64 {
@@ -766,49 +785,53 @@ impl AccountsDB {
             .cloned()
             .collect();
         // parallel scan the index.
-        let (mut purges, purges_in_root) = pubkeys
-            .par_chunks(4096)
-            .map(|pubkeys: &[Pubkey]| {
-                let mut purges_in_root = Vec::new();
-                let mut purges = HashMap::new();
-                for pubkey in pubkeys {
-                    if let Some((locked_entry, index)) =
-                        self.accounts_index.get(pubkey, None, max_clean_root)
-                    {
-                        let (slot, account_info) = &locked_entry.slot_list()[index];
-                        if account_info.lamports == 0 {
-                            purges.insert(
-                                *pubkey,
-                                self.accounts_index
-                                    .roots_and_ref_count(&locked_entry, max_clean_root),
-                            );
-                        }
+        let (mut purges, purges_in_root) = {
+            self.thread_pool_clean.install(|| {
+                pubkeys
+                    .par_chunks(4096)
+                    .map(|pubkeys: &[Pubkey]| {
+                        let mut purges_in_root = Vec::new();
+                        let mut purges = HashMap::new();
+                        for pubkey in pubkeys {
+                            if let Some((locked_entry, index)) =
+                                self.accounts_index.get(pubkey, None, max_clean_root)
+                            {
+                                let (slot, account_info) = &locked_entry.slot_list()[index];
+                                if account_info.lamports == 0 {
+                                    purges.insert(
+                                        *pubkey,
+                                        self.accounts_index
+                                            .roots_and_ref_count(&locked_entry, max_clean_root),
+                                    );
+                                }
 
-                        // Release the lock
-                        let slot = *slot;
-                        drop(locked_entry);
+                                // Release the lock
+                                let slot = *slot;
+                                drop(locked_entry);
 
-                        if self.accounts_index.is_uncleaned_root(slot) {
-                            // Assertion enforced by `accounts_index.get()`, the latest slot
-                            // will not be greater than the given `max_clean_root`
-                            if let Some(max_clean_root) = max_clean_root {
-                                assert!(slot <= max_clean_root);
+                                if self.accounts_index.is_uncleaned_root(slot) {
+                                    // Assertion enforced by `accounts_index.get()`, the latest slot
+                                    // will not be greater than the given `max_clean_root`
+                                    if let Some(max_clean_root) = max_clean_root {
+                                        assert!(slot <= max_clean_root);
+                                    }
+                                    purges_in_root.push(*pubkey);
+                                }
                             }
-                            purges_in_root.push(*pubkey);
                         }
-                    }
-                }
-                (purges, purges_in_root)
+                        (purges, purges_in_root)
+                    })
+                    .reduce(
+                        || (HashMap::new(), Vec::new()),
+                        |mut m1, m2| {
+                            // Collapse down the hashmaps/vecs into one.
+                            m1.0.extend(m2.0);
+                            m1.1.extend(m2.1);
+                            m1
+                        },
+                    )
             })
-            .reduce(
-                || (HashMap::new(), Vec::new()),
-                |mut m1, m2| {
-                    // Collapse down the hashmaps/vecs into one.
-                    m1.0.extend(m2.0);
-                    m1.1.extend(m2.1);
-                    m1
-                },
-            );
+        };
         accounts_scan.stop();
 
         let mut clean_old_rooted = Measure::start("clean_old_roots");
@@ -889,10 +912,7 @@ impl AccountsDB {
         let pubkey_to_slot_set: Vec<_> = purges
             .into_iter()
             .map(|(key, (slots_list, _ref_count))| {
-                (
-                    key,
-                    HashSet::from_iter(slots_list.into_iter().map(|(slot, _)| slot)),
-                )
+                (key, slots_list.into_iter().map(|(slot, _)| slot).collect())
             })
             .collect();
 
@@ -996,11 +1016,28 @@ impl AccountsDB {
     }
 
     fn shrink_stale_slot(&self, candidates: &mut MutexGuard<Vec<Slot>>) -> usize {
-        if let Some(slot) = self.do_next_shrink_slot(candidates) {
-            self.do_shrink_stale_slot(slot)
-        } else {
-            0
+        let mut shrunken_account_total = 0;
+        let mut shrunk_slot_count = 0;
+        let start = Instant::now();
+        let num_roots = self.accounts_index.num_roots();
+        loop {
+            if let Some(slot) = self.do_next_shrink_slot(candidates) {
+                shrunken_account_total += self.do_shrink_stale_slot(slot);
+            } else {
+                return 0;
+            }
+            if start.elapsed().as_millis() > 100 || shrunk_slot_count > num_roots / 10 {
+                debug!(
+                    "do_shrink_stale_slot: {} {} {}us",
+                    shrunk_slot_count,
+                    candidates.len(),
+                    start.elapsed().as_micros()
+                );
+                break;
+            }
+            shrunk_slot_count += 1;
         }
+        shrunken_account_total
     }
 
     // Reads all accounts in given slot's AppendVecs and filter only to alive,
@@ -1015,9 +1052,13 @@ impl AccountsDB {
                 let stores = stores_lock.read().unwrap();
                 let mut alive_count = 0;
                 let mut stored_count = 0;
+                let mut written_bytes = 0;
+                let mut total_bytes = 0;
                 for store in stores.values() {
                     alive_count += store.count();
                     stored_count += store.approx_stored_count();
+                    written_bytes += store.written_bytes();
+                    total_bytes += store.total_bytes();
                 }
                 if alive_count == stored_count && stores.values().len() == 1 {
                     trace!(
@@ -1028,14 +1069,18 @@ impl AccountsDB {
                         if forced { " (forced)" } else { "" },
                     );
                     return 0;
-                } else if (alive_count as f32 / stored_count as f32) >= 0.80 && !forced {
-                    trace!(
-                        "shrink_stale_slot ({}): not enough space to shrink: {} / {}",
-                        slot,
-                        alive_count,
-                        stored_count,
+                } else if !forced {
+                    let sparse_by_count = (alive_count as f32 / stored_count as f32) <= 0.8;
+                    let sparse_by_bytes = (written_bytes as f32 / total_bytes as f32) <= 0.8;
+                    let not_sparse = !sparse_by_count && !sparse_by_bytes;
+                    let too_small_to_shrink = total_bytes <= PAGE_SIZE;
+                    if not_sparse || too_small_to_shrink {
+                        return 0;
+                    }
+                    info!(
+                        "shrink_stale_slot ({}): not_sparse: {} count: {}/{} byte: {}/{}",
+                        slot, not_sparse, alive_count, stored_count, written_bytes, total_bytes,
                     );
-                    return 0;
                 }
                 for store in stores.values() {
                     let mut start = 0;
@@ -1129,7 +1174,17 @@ impl AccountsDB {
             {
                 new_store
             } else {
-                self.create_and_insert_store(slot, aligned_total, "shrink")
+                let maybe_shrink_paths = self.shrink_paths.read().unwrap();
+                if let Some(ref shrink_paths) = *maybe_shrink_paths {
+                    self.create_and_insert_store_with_paths(
+                        slot,
+                        aligned_total,
+                        "shrink-w-path",
+                        shrink_paths,
+                    )
+                } else {
+                    self.create_and_insert_store(slot, aligned_total, "shrink")
+                }
             };
             start.stop();
             create_and_insert_store_elapsed = start.as_us();
@@ -1386,14 +1441,9 @@ impl AccountsDB {
         bank_hashes.insert(slot, new_hash_info);
     }
 
-    pub fn load(
-        storage: &AccountStorage,
-        ancestors: &Ancestors,
-        accounts_index: &AccountsIndex<AccountInfo>,
-        pubkey: &Pubkey,
-    ) -> Option<(Account, Slot)> {
+    pub fn load(&self, ancestors: &Ancestors, pubkey: &Pubkey) -> Option<(Account, Slot)> {
         let (slot, store_id, offset) = {
-            let (lock, index) = accounts_index.get(pubkey, Some(ancestors), None)?;
+            let (lock, index) = self.accounts_index.get(pubkey, Some(ancestors), None)?;
             let slot_list = lock.slot_list();
             let (
                 slot,
@@ -1406,7 +1456,7 @@ impl AccountsDB {
         };
 
         //TODO: thread this as a ref
-        storage
+        self.storage
             .get_account_storage_entry(slot, store_id)
             .and_then(|store| {
                 store
@@ -1443,7 +1493,7 @@ impl AccountsDB {
     }
 
     pub fn load_slow(&self, ancestors: &Ancestors, pubkey: &Pubkey) -> Option<(Account, Slot)> {
-        Self::load(&self.storage, ancestors, &self.accounts_index, pubkey)
+        self.load(ancestors, pubkey)
     }
 
     fn get_account_from_storage(&self, slot: Slot, account_info: &AccountInfo) -> Option<Account> {
@@ -1581,7 +1631,7 @@ impl AccountsDB {
             self.stats
                 .create_store_count
                 .fetch_add(1, Ordering::Relaxed);
-            self.create_store(slot, self.file_size, "store")
+            self.create_store(slot, self.file_size, "store", &self.paths)
         };
 
         // try_available is like taking a lock on the store,
@@ -1610,11 +1660,17 @@ impl AccountsDB {
         false
     }
 
-    fn create_store(&self, slot: Slot, size: u64, from: &str) -> Arc<AccountStorageEntry> {
-        let path_index = thread_rng().gen_range(0, self.paths.len());
+    fn create_store(
+        &self,
+        slot: Slot,
+        size: u64,
+        from: &str,
+        paths: &[PathBuf],
+    ) -> Arc<AccountStorageEntry> {
+        let path_index = thread_rng().gen_range(0, paths.len());
         let store = Arc::new(self.new_storage_entry(
             slot,
-            &Path::new(&self.paths[path_index]),
+            &Path::new(&paths[path_index]),
             self.page_align(size),
         ));
 
@@ -1637,7 +1693,17 @@ impl AccountsDB {
         size: u64,
         from: &str,
     ) -> Arc<AccountStorageEntry> {
-        let store = self.create_store(slot, size, from);
+        self.create_and_insert_store_with_paths(slot, size, from, &self.paths)
+    }
+
+    fn create_and_insert_store_with_paths(
+        &self,
+        slot: Slot,
+        size: u64,
+        from: &str,
+        paths: &[PathBuf],
+    ) -> Arc<AccountStorageEntry> {
+        let store = self.create_store(slot, size, from, paths);
         let store_for_index = store.clone();
 
         self.insert_store(slot, store_for_index);
@@ -2232,7 +2298,12 @@ impl AccountsDB {
         lamports: u64,
         owner: &Pubkey,
         executable: bool,
+        simple_capitalization_enabled: bool,
     ) -> u64 {
+        if simple_capitalization_enabled {
+            return lamports;
+        }
+
         let is_specially_retained = (solana_sdk::native_loader::check_id(owner) && executable)
             || solana_sdk::sysvar::check_id(owner);
 
@@ -2251,6 +2322,7 @@ impl AccountsDB {
         slot: Slot,
         ancestors: &Ancestors,
         check_hash: bool,
+        simple_capitalization_enabled: bool,
     ) -> Result<(Hash, u64), BankHashVerificationError> {
         use BankHashVerificationError::*;
         let mut scan = Measure::start("scan");
@@ -2263,48 +2335,53 @@ impl AccountsDB {
             .cloned()
             .collect();
         let mismatch_found = AtomicU64::new(0);
-        let hashes: Vec<(Pubkey, Hash, u64)> = keys
-            .par_iter()
-            .filter_map(|pubkey| {
-                if let Some((lock, index)) =
-                    self.accounts_index.get(pubkey, Some(ancestors), Some(slot))
-                {
-                    let (slot, account_info) = &lock.slot_list()[index];
-                    if account_info.lamports != 0 {
-                        self.storage
-                            .get_account_storage_entry(*slot, account_info.store_id)
-                            .and_then(|store| {
-                                let account = store.accounts.get_account(account_info.offset)?.0;
-                                let balance = Self::account_balance_for_capitalization(
-                                    account_info.lamports,
-                                    &account.account_meta.owner,
-                                    account.account_meta.executable,
-                                );
+        let hashes: Vec<(Pubkey, Hash, u64)> = {
+            self.thread_pool_clean.install(|| {
+                keys.par_iter()
+                    .filter_map(|pubkey| {
+                        if let Some((lock, index)) =
+                            self.accounts_index.get(pubkey, Some(ancestors), Some(slot))
+                        {
+                            let (slot, account_info) = &lock.slot_list()[index];
+                            if account_info.lamports != 0 {
+                                self.storage
+                                    .get_account_storage_entry(*slot, account_info.store_id)
+                                    .and_then(|store| {
+                                        let account =
+                                            store.accounts.get_account(account_info.offset)?.0;
+                                        let balance = Self::account_balance_for_capitalization(
+                                            account_info.lamports,
+                                            &account.account_meta.owner,
+                                            account.account_meta.executable,
+                                            simple_capitalization_enabled,
+                                        );
 
-                                if check_hash {
-                                    let hash = Self::hash_stored_account(
-                                        *slot,
-                                        &account,
-                                        &self
-                                            .cluster_type
-                                            .expect("Cluster type must be set at initialization"),
-                                    );
-                                    if hash != *account.hash {
-                                        mismatch_found.fetch_add(1, Ordering::Relaxed);
-                                        return None;
-                                    }
-                                }
+                                        if check_hash {
+                                            let hash = Self::hash_stored_account(
+                                                *slot,
+                                                &account,
+                                                &self.cluster_type.expect(
+                                                    "Cluster type must be set at initialization",
+                                                ),
+                                            );
+                                            if hash != *account.hash {
+                                                mismatch_found.fetch_add(1, Ordering::Relaxed);
+                                                return None;
+                                            }
+                                        }
 
-                                Some((*pubkey, *account.hash, balance))
-                            })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                                        Some((*pubkey, *account.hash, balance))
+                                    })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
             })
-            .collect();
+        };
         if mismatch_found.load(Ordering::Relaxed) > 0 {
             warn!(
                 "{} mismatched account hash(es) found",
@@ -2335,9 +2412,14 @@ impl AccountsDB {
         bank_hash_info.snapshot_hash
     }
 
-    pub fn update_accounts_hash(&self, slot: Slot, ancestors: &Ancestors) -> (Hash, u64) {
+    pub fn update_accounts_hash(
+        &self,
+        slot: Slot,
+        ancestors: &Ancestors,
+        simple_capitalization_enabled: bool,
+    ) -> (Hash, u64) {
         let (hash, total_lamports) = self
-            .calculate_accounts_hash(slot, ancestors, false)
+            .calculate_accounts_hash(slot, ancestors, false, simple_capitalization_enabled)
             .unwrap();
         let mut bank_hashes = self.bank_hashes.write().unwrap();
         let mut bank_hash_info = bank_hashes.get_mut(&slot).unwrap();
@@ -2350,11 +2432,12 @@ impl AccountsDB {
         slot: Slot,
         ancestors: &Ancestors,
         total_lamports: u64,
+        simple_capitalization_enabled: bool,
     ) -> Result<(), BankHashVerificationError> {
         use BankHashVerificationError::*;
 
         let (calculated_hash, calculated_lamports) =
-            self.calculate_accounts_hash(slot, ancestors, true)?;
+            self.calculate_accounts_hash(slot, ancestors, true, simple_capitalization_enabled)?;
 
         if calculated_lamports != total_lamports {
             warn!(
@@ -2844,6 +2927,7 @@ impl AccountsDB {
 
     pub fn generate_index(&self) {
         let mut slots = self.storage.all_slots();
+        #[allow(clippy::stable_sort_primitive)]
         slots.sort();
 
         let mut last_log_update = Instant::now();
@@ -2951,6 +3035,7 @@ impl AccountsDB {
 
     fn print_index(&self, label: &str) {
         let mut roots: Vec<_> = self.accounts_index.all_roots();
+        #[allow(clippy::stable_sort_primitive)]
         roots.sort();
         info!("{}: accounts_index roots: {:?}", label, roots,);
         for (pubkey, account_entry) in self.accounts_index.account_maps.read().unwrap().iter() {
@@ -2964,12 +3049,14 @@ impl AccountsDB {
 
     fn print_count_and_status(&self, label: &str) {
         let mut slots: Vec<_> = self.storage.all_slots();
+        #[allow(clippy::stable_sort_primitive)]
         slots.sort();
         info!("{}: count_and status for {} slots:", label, slots.len());
         for slot in &slots {
             let slot_stores = self.storage.get_slot_stores(*slot).unwrap();
             let r_slot_stores = slot_stores.read().unwrap();
             let mut ids: Vec<_> = r_slot_stores.keys().cloned().collect();
+            #[allow(clippy::stable_sort_primitive)]
             ids.sort();
             for id in &ids {
                 let entry = r_slot_stores.get(id).unwrap();
@@ -3002,7 +3089,7 @@ pub mod tests {
     use assert_matches::assert_matches;
     use rand::{thread_rng, Rng};
     use solana_sdk::{account::Account, hash::HASH_BYTES};
-    use std::{fs, str::FromStr};
+    use std::{fs, iter::FromIterator, str::FromStr};
 
     fn linear_ancestors(end_slot: u64) -> Ancestors {
         let mut ancestors: Ancestors = vec![(0, 0)].into_iter().collect();
@@ -3124,8 +3211,10 @@ pub mod tests {
             let idx = thread_rng().gen_range(0, 99);
             let ancestors = vec![(0, 0)].into_iter().collect();
             let account = db.load_slow(&ancestors, &pubkeys[idx]).unwrap();
-            let mut default_account = Account::default();
-            default_account.lamports = (idx + 1) as u64;
+            let default_account = Account {
+                lamports: (idx + 1) as u64,
+                ..Account::default()
+            };
             assert_eq!((default_account, 0), account);
         }
 
@@ -3138,8 +3227,10 @@ pub mod tests {
             let account0 = db.load_slow(&ancestors, &pubkeys[idx]).unwrap();
             let ancestors = vec![(1, 1)].into_iter().collect();
             let account1 = db.load_slow(&ancestors, &pubkeys[idx]).unwrap();
-            let mut default_account = Account::default();
-            default_account.lamports = (idx + 1) as u64;
+            let default_account = Account {
+                lamports: (idx + 1) as u64,
+                ..Account::default()
+            };
             assert_eq!(&default_account, &account0.0);
             assert_eq!(&default_account, &account1.0);
         }
@@ -3330,8 +3421,10 @@ pub mod tests {
                     let ancestors = vec![(slot, 0)].into_iter().collect();
                     assert!(accounts.load_slow(&ancestors, &pubkeys[idx]).is_none());
                 } else {
-                    let mut default_account = Account::default();
-                    default_account.lamports = account.lamports;
+                    let default_account = Account {
+                        lamports: account.lamports,
+                        ..Account::default()
+                    };
                     assert_eq!(default_account, account);
                 }
             }
@@ -3412,8 +3505,10 @@ pub mod tests {
         create_account(&db, &mut pubkeys, 0, 1, 0, 0);
         let ancestors = vec![(0, 0)].into_iter().collect();
         let account = db.load_slow(&ancestors, &pubkeys[0]).unwrap();
-        let mut default_account = Account::default();
-        default_account.lamports = 1;
+        let default_account = Account {
+            lamports: 1,
+            ..Account::default()
+        };
         assert_eq!((default_account, 0), account);
     }
 
@@ -3997,8 +4092,8 @@ pub mod tests {
 
         let ancestors = linear_ancestors(latest_slot);
         assert_eq!(
-            daccounts.update_accounts_hash(latest_slot, &ancestors),
-            accounts.update_accounts_hash(latest_slot, &ancestors)
+            daccounts.update_accounts_hash(latest_slot, &ancestors, true),
+            accounts.update_accounts_hash(latest_slot, &ancestors, true)
         );
     }
 
@@ -4151,12 +4246,12 @@ pub mod tests {
 
         let ancestors = linear_ancestors(current_slot);
         info!("ancestors: {:?}", ancestors);
-        let hash = accounts.update_accounts_hash(current_slot, &ancestors);
+        let hash = accounts.update_accounts_hash(current_slot, &ancestors, true);
 
         accounts.clean_accounts(None);
 
         assert_eq!(
-            accounts.update_accounts_hash(current_slot, &ancestors),
+            accounts.update_accounts_hash(current_slot, &ancestors, true),
             hash
         );
 
@@ -4273,7 +4368,7 @@ pub mod tests {
         accounts.add_root(current_slot);
 
         accounts.print_accounts_stats("pre_f");
-        accounts.update_accounts_hash(4, &HashMap::default());
+        accounts.update_accounts_hash(4, &HashMap::default(), true);
 
         let accounts = f(accounts, current_slot);
 
@@ -4285,7 +4380,7 @@ pub mod tests {
         assert_load_account(&accounts, current_slot, dummy_pubkey, dummy_lamport);
 
         accounts
-            .verify_bank_hash_and_lamports(4, &HashMap::default(), 1222)
+            .verify_bank_hash_and_lamports(4, &HashMap::default(), 1222, true)
             .unwrap();
     }
 
@@ -4403,7 +4498,7 @@ pub mod tests {
 
         db.print_accounts_stats("pre");
 
-        let slots: HashSet<Slot> = HashSet::from_iter(vec![1].into_iter());
+        let slots: HashSet<Slot> = vec![1].into_iter().collect();
         let purge_keys = vec![(key1, slots)];
         let (_reclaims, dead_keys) = db.purge_keys_exact(purge_keys);
 
@@ -4682,15 +4777,15 @@ pub mod tests {
 
         db.store(some_slot, &[(&key, &account)]);
         db.add_root(some_slot);
-        db.update_accounts_hash(some_slot, &ancestors);
+        db.update_accounts_hash(some_slot, &ancestors, true);
         assert_matches!(
-            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1),
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1, true),
             Ok(_)
         );
 
         db.bank_hashes.write().unwrap().remove(&some_slot).unwrap();
         assert_matches!(
-            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1),
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1, true),
             Err(MissingBankHash)
         );
 
@@ -4705,7 +4800,7 @@ pub mod tests {
             .unwrap()
             .insert(some_slot, bank_hash_info);
         assert_matches!(
-            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1),
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1, true),
             Err(MismatchedBankHash)
         );
     }
@@ -4724,9 +4819,9 @@ pub mod tests {
 
         db.store(some_slot, &[(&key, &account)]);
         db.add_root(some_slot);
-        db.update_accounts_hash(some_slot, &ancestors);
+        db.update_accounts_hash(some_slot, &ancestors, true);
         assert_matches!(
-            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1),
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1, true),
             Ok(_)
         );
 
@@ -4735,18 +4830,22 @@ pub mod tests {
             some_slot,
             &[(
                 &native_account_pubkey,
-                &solana_sdk::native_loader::create_loadable_account("foo"),
+                &solana_sdk::native_loader::create_loadable_account("foo", 1),
             )],
         );
-        db.update_accounts_hash(some_slot, &ancestors);
+        db.update_accounts_hash(some_slot, &ancestors, true);
         assert_matches!(
-            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1),
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1, false),
+            Ok(_)
+        );
+        assert_matches!(
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 2, true),
             Ok(_)
         );
 
         assert_matches!(
-            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 10),
-            Err(MismatchedTotalLamports(expected, actual)) if expected == 1 && actual == 10
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 10, true),
+            Err(MismatchedTotalLamports(expected, actual)) if expected == 2 && actual == 10
         );
     }
 
@@ -4763,9 +4862,9 @@ pub mod tests {
             .unwrap()
             .insert(some_slot, BankHashInfo::default());
         db.add_root(some_slot);
-        db.update_accounts_hash(some_slot, &ancestors);
+        db.update_accounts_hash(some_slot, &ancestors, true);
         assert_matches!(
-            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 0),
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 0, true),
             Ok(_)
         );
     }
@@ -4790,7 +4889,7 @@ pub mod tests {
         db.store_accounts_default(some_slot, accounts, &[some_hash]);
         db.add_root(some_slot);
         assert_matches!(
-            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1),
+            db.verify_bank_hash_and_lamports(some_slot, &ancestors, 1, true),
             Err(MismatchedAccountHash)
         );
     }
@@ -5207,7 +5306,7 @@ pub mod tests {
 
         accounts.reset_uncleaned_roots();
         let mut actual_slots = accounts.shrink_candidate_slots.lock().unwrap().clone();
-        actual_slots.sort();
+        actual_slots.sort_unstable();
         assert_eq!(actual_slots, vec![0, 1, 2]);
 
         accounts.accounts_index.clear_roots();
@@ -5266,14 +5365,14 @@ pub mod tests {
         );
 
         let no_ancestors = HashMap::default();
-        accounts.update_accounts_hash(current_slot, &no_ancestors);
+        accounts.update_accounts_hash(current_slot, &no_ancestors, true);
         accounts
-            .verify_bank_hash_and_lamports(current_slot, &no_ancestors, 22300)
+            .verify_bank_hash_and_lamports(current_slot, &no_ancestors, 22300, true)
             .unwrap();
 
         let accounts = reconstruct_accounts_db_via_serialization(&accounts, current_slot);
         accounts
-            .verify_bank_hash_and_lamports(current_slot, &no_ancestors, 22300)
+            .verify_bank_hash_and_lamports(current_slot, &no_ancestors, 22300, true)
             .unwrap();
 
         // repeating should be no-op
@@ -5290,7 +5389,7 @@ pub mod tests {
 
         let accounts = AccountsDB::new_single();
 
-        let pubkey_count = 100;
+        let pubkey_count = 30000;
         let pubkeys: Vec<_> = (0..pubkey_count)
             .map(|_| solana_sdk::pubkey::new_rand())
             .collect();
@@ -5311,7 +5410,7 @@ pub mod tests {
         accounts.add_root(current_slot);
 
         current_slot += 1;
-        let pubkey_count_after_shrink = 90;
+        let pubkey_count_after_shrink = 25000;
         let updated_pubkeys = &pubkeys[0..pubkey_count - pubkey_count_after_shrink];
 
         for pubkey in updated_pubkeys {
@@ -5400,7 +5499,7 @@ pub mod tests {
         store_counts.insert(3, (1, HashSet::from_iter(vec![key2])));
         AccountsDB::calc_delete_dependencies(&purges, &mut store_counts);
         let mut stores: Vec<_> = store_counts.keys().cloned().collect();
-        stores.sort();
+        stores.sort_unstable();
         for store in &stores {
             info!(
                 "store: {:?} : {:?}",
@@ -5470,7 +5569,7 @@ pub mod tests {
     fn test_account_balance_for_capitalization_normal() {
         // system accounts
         assert_eq!(
-            AccountsDB::account_balance_for_capitalization(10, &Pubkey::default(), false),
+            AccountsDB::account_balance_for_capitalization(10, &Pubkey::default(), false, true),
             10
         );
         // any random program data accounts
@@ -5478,7 +5577,17 @@ pub mod tests {
             AccountsDB::account_balance_for_capitalization(
                 10,
                 &solana_sdk::pubkey::new_rand(),
-                false
+                false,
+                true,
+            ),
+            10
+        );
+        assert_eq!(
+            AccountsDB::account_balance_for_capitalization(
+                10,
+                &solana_sdk::pubkey::new_rand(),
+                false,
+                false,
             ),
             10
         );
@@ -5494,28 +5603,62 @@ pub mod tests {
             AccountsDB::account_balance_for_capitalization(
                 normal_sysvar.lamports,
                 &normal_sysvar.owner,
-                normal_sysvar.executable
+                normal_sysvar.executable,
+                false,
             ),
             0
+        );
+        assert_eq!(
+            AccountsDB::account_balance_for_capitalization(
+                normal_sysvar.lamports,
+                &normal_sysvar.owner,
+                normal_sysvar.executable,
+                true,
+            ),
+            1
         );
 
         // currently transactions can send any lamports to sysvars although this is not sensible.
         assert_eq!(
-            AccountsDB::account_balance_for_capitalization(10, &solana_sdk::sysvar::id(), false),
+            AccountsDB::account_balance_for_capitalization(
+                10,
+                &solana_sdk::sysvar::id(),
+                false,
+                false
+            ),
             9
+        );
+        assert_eq!(
+            AccountsDB::account_balance_for_capitalization(
+                10,
+                &solana_sdk::sysvar::id(),
+                false,
+                true
+            ),
+            10
         );
     }
 
     #[test]
     fn test_account_balance_for_capitalization_native_program() {
-        let normal_native_program = solana_sdk::native_loader::create_loadable_account("foo");
+        let normal_native_program = solana_sdk::native_loader::create_loadable_account("foo", 1);
         assert_eq!(
             AccountsDB::account_balance_for_capitalization(
                 normal_native_program.lamports,
                 &normal_native_program.owner,
-                normal_native_program.executable
+                normal_native_program.executable,
+                false,
             ),
             0
+        );
+        assert_eq!(
+            AccountsDB::account_balance_for_capitalization(
+                normal_native_program.lamports,
+                &normal_native_program.owner,
+                normal_native_program.executable,
+                true,
+            ),
+            1
         );
 
         // test maliciously assigned bogus native loader account
@@ -5523,10 +5666,20 @@ pub mod tests {
             AccountsDB::account_balance_for_capitalization(
                 1,
                 &solana_sdk::native_loader::id(),
-                false
+                false,
+                false,
             ),
             1
-        )
+        );
+        assert_eq!(
+            AccountsDB::account_balance_for_capitalization(
+                1,
+                &solana_sdk::native_loader::id(),
+                false,
+                true,
+            ),
+            1
+        );
     }
 
     #[test]

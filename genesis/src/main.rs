@@ -23,6 +23,7 @@ use solana_sdk::{
     epoch_schedule::EpochSchedule,
     fee_calculator::FeeRateGovernor,
     genesis_config::{ClusterType, GenesisConfig},
+    inflation::Inflation,
     native_token::sol_to_lamports,
     poh_config::PohConfig,
     pubkey::Pubkey,
@@ -271,6 +272,15 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .validator(is_valid_percentage),
         )
         .arg(
+            Arg::with_name("vote_commission_percentage")
+                .long("vote-commission-percentage")
+                .value_name("NUMBER")
+                .takes_value(true)
+                .default_value("100")
+                .help("percentage of vote commission")
+                .validator(is_valid_percentage),
+        )
+        .arg(
             Arg::with_name("target_signatures_per_slot")
                 .long("target-signatures-per-slot")
                 .value_name("NUMBER")
@@ -363,6 +373,14 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .multiple(true)
                 .help("Install a BPF program at the given address"),
         )
+        .arg(
+            Arg::with_name("inflation")
+                .required(false)
+                .long("inflation")
+                .takes_value(true)
+                .possible_values(&["pico", "full", "none"])
+                .help("Selects inflation"),
+        )
         .get_matches();
 
     let ledger_path = PathBuf::from(matches.value_of("ledger_path").unwrap());
@@ -425,11 +443,13 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     );
     fee_rate_governor.burn_percent = value_t_or_exit!(matches, "fee_burn_percentage", u8);
 
-    let mut poh_config = PohConfig::default();
-    poh_config.target_tick_duration = if matches.is_present("target_tick_duration") {
-        Duration::from_micros(value_t_or_exit!(matches, "target_tick_duration", u64))
-    } else {
-        Duration::from_micros(default_target_tick_duration)
+    let mut poh_config = PohConfig {
+        target_tick_duration: if matches.is_present("target_tick_duration") {
+            Duration::from_micros(value_t_or_exit!(matches, "target_tick_duration", u64))
+        } else {
+            Duration::from_micros(default_target_tick_duration)
+        },
+        ..PohConfig::default()
     };
 
     let cluster_type = cluster_type_of(&matches, "cluster_type").unwrap();
@@ -491,6 +511,18 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         ..GenesisConfig::default()
     };
 
+    if let Ok(raw_inflation) = value_t!(matches, "inflation", String) {
+        let inflation = match raw_inflation.as_str() {
+            "pico" => Inflation::pico(),
+            "full" => Inflation::full(),
+            "none" => Inflation::new_disabled(),
+            _ => unreachable!(),
+        };
+        genesis_config.inflation = inflation;
+    }
+
+    let commission = value_t_or_exit!(matches, "vote_commission_percentage", u8);
+
     let mut bootstrap_validator_pubkeys_iter = bootstrap_validator_pubkeys.iter();
     loop {
         let identity_pubkey = match bootstrap_validator_pubkeys_iter.next() {
@@ -509,7 +541,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             &identity_pubkey,
             &identity_pubkey,
             &identity_pubkey,
-            100,
+            commission,
             VoteState::get_rent_exempt_reserve(&rent).max(1),
         );
 
@@ -633,7 +665,7 @@ mod tests {
             solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 2 as u64,
+                balance: 2,
                 executable: false,
                 data: String::from("aGVsbG8="),
             },
@@ -642,7 +674,7 @@ mod tests {
             solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 1 as u64,
+                balance: 1,
                 executable: true,
                 data: String::from("aGVsbG8gd29ybGQ="),
             },
@@ -651,7 +683,7 @@ mod tests {
             solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 3 as u64,
+                balance: 3,
                 executable: true,
                 data: String::from("bWUgaGVsbG8gdG8gd29ybGQ="),
             },
@@ -706,7 +738,7 @@ mod tests {
             solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 6 as u64,
+                balance: 6,
                 executable: true,
                 data: String::from("eW91IGFyZQ=="),
             },
@@ -715,7 +747,7 @@ mod tests {
             solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 5 as u64,
+                balance: 5,
                 executable: false,
                 data: String::from("bWV0YSBzdHJpbmc="),
             },
@@ -724,7 +756,7 @@ mod tests {
             solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 10 as u64,
+                balance: 10,
                 executable: false,
                 data: String::from("YmFzZTY0IHN0cmluZw=="),
             },
@@ -789,7 +821,7 @@ mod tests {
             serde_json::to_string(&account_keypairs[0].to_bytes().to_vec()).unwrap(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 20 as u64,
+                balance: 20,
                 executable: true,
                 data: String::from("Y2F0IGRvZw=="),
             },
@@ -798,7 +830,7 @@ mod tests {
             serde_json::to_string(&account_keypairs[1].to_bytes().to_vec()).unwrap(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 15 as u64,
+                balance: 15,
                 executable: false,
                 data: String::from("bW9ua2V5IGVsZXBoYW50"),
             },
@@ -807,7 +839,7 @@ mod tests {
             serde_json::to_string(&account_keypairs[2].to_bytes().to_vec()).unwrap(),
             Base64Account {
                 owner: solana_sdk::pubkey::new_rand().to_string(),
-                balance: 30 as u64,
+                balance: 30,
                 executable: true,
                 data: String::from("Y29tYSBtb2Nh"),
             },

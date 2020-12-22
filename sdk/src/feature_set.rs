@@ -94,6 +94,26 @@ pub mod rewrite_stake {
     solana_sdk::declare_id!("6ap2eGy7wx5JmsWUmQ5sHwEWrFSDUxSti2k5Hbfv5BZG");
 }
 
+pub mod filter_stake_delegation_accounts {
+    solana_sdk::declare_id!("GE7fRxmW46K6EmCD9AMZSbnaJ2e3LfqCZzdHi9hmYAgi");
+}
+
+pub mod simple_capitalization {
+    solana_sdk::declare_id!("9r69RnnxABmpcPFfj1yhg4n9YFR2MNaLdKJCC6v3Speb");
+}
+
+pub mod bpf_loader_upgradeable_program {
+    solana_sdk::declare_id!("FbhK8HN9qvNHvJcoFVHAEUCNkagHvu7DTWzdnLuVQ5u4");
+}
+
+pub mod try_find_program_address_syscall_enabled {
+    solana_sdk::declare_id!("EMsMNadQNhCYDyGpYH5Tx6dGHxiUqKHk782PU5XaWfmi");
+}
+
+pub mod warp_testnet_timestamp {
+    solana_sdk::declare_id!("Bfqm7fGk5MBptqa2WHXWFLH7uJvq8hkJcAQPipy2bAMk");
+}
+
 lazy_static! {
     /// Map of feature identifiers to user-visible description
     pub static ref FEATURE_NAMES: HashMap<Pubkey, &'static str> = [
@@ -119,6 +139,11 @@ lazy_static! {
         (timestamp_bounding::id(), "add timestamp-correction bounding #13120"),
         (stake_program_v2::id(), "solana_stake_program v2"),
         (rewrite_stake::id(), "rewrite stake"),
+        (filter_stake_delegation_accounts::id(), "filter stake_delegation_accounts #14062"),
+        (simple_capitalization::id(), "simple capitalization"),
+        (bpf_loader_upgradeable_program::id(), "upgradeable bpf loader"),
+        (try_find_program_address_syscall_enabled::id(), "add try_find_program_address syscall"),
+        (warp_testnet_timestamp::id(), "warp testnet timestamp to current #14210"),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()

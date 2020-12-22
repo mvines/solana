@@ -113,7 +113,17 @@ impl AggregateCommitmentService {
                     "aggregate-commitment-ms",
                     aggregate_commitment_time.as_ms() as i64,
                     i64
-                )
+                ),
+                (
+                    "highest-confirmed-root",
+                    update_commitment_slots.highest_confirmed_root as i64,
+                    i64
+                ),
+                (
+                    "highest-confirmed-slot",
+                    update_commitment_slots.highest_confirmed_slot as i64,
+                    i64
+                ),
             );
 
             // Triggers rpc_subscription notifications as soon as new commitment data is available,
@@ -239,6 +249,7 @@ mod tests {
     use super::*;
     use solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo};
     use solana_runtime::{
+        accounts_background_service::ABSRequestSender,
         bank_forks::BankForks,
         genesis_utils::{create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs},
     };
@@ -529,7 +540,7 @@ mod tests {
             &working_bank,
         );
         for x in 0..root {
-            bank_forks.set_root(x, &None, None);
+            bank_forks.set_root(x, &ABSRequestSender::default(), None);
         }
 
         // Add an additional bank/vote that will root slot 2
@@ -566,7 +577,11 @@ mod tests {
             .read()
             .unwrap()
             .highest_confirmed_root();
-        bank_forks.set_root(root, &None, Some(highest_confirmed_root));
+        bank_forks.set_root(
+            root,
+            &ABSRequestSender::default(),
+            Some(highest_confirmed_root),
+        );
         let highest_confirmed_root_bank = bank_forks.get(highest_confirmed_root);
         assert!(highest_confirmed_root_bank.is_some());
 
@@ -631,7 +646,11 @@ mod tests {
             .read()
             .unwrap()
             .highest_confirmed_root();
-        bank_forks.set_root(root, &None, Some(highest_confirmed_root));
+        bank_forks.set_root(
+            root,
+            &ABSRequestSender::default(),
+            Some(highest_confirmed_root),
+        );
         let highest_confirmed_root_bank = bank_forks.get(highest_confirmed_root);
         assert!(highest_confirmed_root_bank.is_some());
     }

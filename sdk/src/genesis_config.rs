@@ -20,7 +20,7 @@ use crate::{
 };
 use bincode::{deserialize, serialize};
 use chrono::{TimeZone, Utc};
-use memmap::Mmap;
+use memmap2::Mmap;
 use std::{
     collections::BTreeMap,
     fmt,
@@ -147,6 +147,11 @@ impl GenesisConfig {
     pub fn hash(&self) -> Hash {
         let serialized = serialize(&self).unwrap();
         hash(&serialized)
+    }
+
+    pub fn disable_cap_altering_features_for_preciseness(&mut self) {
+        self.accounts
+            .remove(&crate::feature_set::simple_capitalization::id());
     }
 
     fn genesis_filename(ledger_path: &Path) -> PathBuf {

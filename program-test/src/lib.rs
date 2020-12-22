@@ -39,6 +39,7 @@ use {
 
 // Export types so test clients can limit their solana crate dependencies
 pub use solana_banks_client::BanksClient;
+pub mod programs;
 
 #[macro_use]
 extern crate solana_bpf_loader_program;
@@ -73,9 +74,11 @@ pub fn builtin_process_instruction(
     input: &[u8],
     invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
-    let mut mock_invoke_context = MockInvokeContext::default();
-    mock_invoke_context.programs = invoke_context.get_programs().to_vec();
-    mock_invoke_context.key = *program_id;
+    let mock_invoke_context = MockInvokeContext {
+        programs: invoke_context.get_programs().to_vec(),
+        key: *program_id,
+        ..MockInvokeContext::default()
+    };
     // TODO: Populate MockInvokeContext more, or rework to avoid MockInvokeContext entirely.
     //       The context being passed into the program is incomplete...
     let local_invoke_context = RefCell::new(Rc::new(mock_invoke_context));
@@ -337,7 +340,17 @@ impl program_stubs::SyscallStubs for SyscallStubs {
     }
 }
 
-fn find_file(filename: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
+pub fn find_file(filename: &str) -> Option<PathBuf> {
+    let mut search_path = vec![];
+    if let Ok(bpf_out_dir) = std::env::var("BPF_OUT_DIR") {
+        search_path.push(PathBuf::from(bpf_out_dir));
+    }
+    search_path.push(PathBuf::from("tests/fixtures"));
+    if let Ok(dir) = std::env::current_dir() {
+        search_path.push(dir);
+    }
+    trace!("search path: {:?}", search_path);
+
     for path in search_path {
         let candidate = path.join(&filename);
         if candidate.exists() {
@@ -347,7 +360,7 @@ fn find_file(filename: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-fn read_file<P: AsRef<Path>>(path: P) -> Vec<u8> {
+pub fn read_file<P: AsRef<Path>>(path: P) -> Vec<u8> {
     let path = path.as_ref();
     let mut file = File::open(path)
         .unwrap_or_else(|err| panic!("Failed to open \"{}\": {}", path.display(), err));
@@ -358,30 +371,11 @@ fn read_file<P: AsRef<Path>>(path: P) -> Vec<u8> {
     file_data
 }
 
-mod spl_token {
-    solana_sdk::declare_id!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-}
-mod spl_memo {
-    solana_sdk::declare_id!("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo");
-}
-mod spl_associated_token_account {
-    solana_sdk::declare_id!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-}
-static SPL_PROGRAMS: &[(Pubkey, &[u8])] = &[
-    (spl_token::ID, include_bytes!("programs/spl_token-2.0.6.so")),
-    (spl_memo::ID, include_bytes!("programs/spl_memo-1.0.0.so")),
-    (
-        spl_associated_token_account::ID,
-        include_bytes!("programs/spl_associated-token-account-1.0.1.so"),
-    ),
-];
-
 pub struct ProgramTest {
     accounts: Vec<(Pubkey, Account)>,
     builtins: Vec<Builtin>,
     bpf_compute_max_units: Option<u64>,
     prefer_bpf: bool,
-    search_path: Vec<PathBuf>,
 }
 
 impl Default for ProgramTest {
@@ -405,25 +399,13 @@ impl Default for ProgramTest {
              solana_runtime::system_instruction_processor=trace,\
              solana_program_test=info",
         );
-        let mut prefer_bpf = false;
-
-        let mut search_path = vec![];
-        if let Ok(bpf_out_dir) = std::env::var("BPF_OUT_DIR") {
-            prefer_bpf = true;
-            search_path.push(PathBuf::from(bpf_out_dir));
-        }
-        search_path.push(PathBuf::from("tests/fixtures"));
-        if let Ok(dir) = std::env::current_dir() {
-            search_path.push(dir);
-        }
-        debug!("search path: {:?}", search_path);
+        let prefer_bpf = std::env::var("BPF_OUT_DIR").is_ok();
 
         Self {
             accounts: vec![],
             builtins: vec![],
             bpf_compute_max_units: None,
             prefer_bpf,
-            search_path,
         }
     }
 }
@@ -466,7 +448,7 @@ impl ProgramTest {
             address,
             Account {
                 lamports,
-                data: read_file(find_file(filename, &self.search_path).unwrap_or_else(|| {
+                data: read_file(find_file(filename).unwrap_or_else(|| {
                     panic!("Unable to locate {}", filename);
                 })),
                 owner,
@@ -512,7 +494,7 @@ impl ProgramTest {
         process_instruction: Option<ProcessInstructionWithContext>,
     ) {
         let loader = solana_program::bpf_loader::id();
-        let program_file = find_file(&format!("{}.so", program_name), &self.search_path);
+        let program_file = find_file(&format!("{}.so", program_name));
 
         if process_instruction.is_none() && program_file.is_none() {
             panic!("Unable to add program {} ({})", program_name, program_id);
@@ -614,17 +596,8 @@ impl ProgramTest {
         }
 
         // Add commonly-used SPL programs as a convenience to the user
-        for (program_id, elf) in SPL_PROGRAMS.iter() {
-            bank.store_account(
-                program_id,
-                &Account {
-                    lamports: Rent::default().minimum_balance(elf.len()).min(1),
-                    data: elf.to_vec(),
-                    owner: solana_program::bpf_loader::id(),
-                    executable: true,
-                    rent_epoch: 0,
-                },
-            )
+        for (program_id, account) in programs::spl_programs(&Rent::default()).iter() {
+            bank.store_account(program_id, &account);
         }
 
         // User-supplied additional builtins

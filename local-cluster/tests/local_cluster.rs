@@ -68,8 +68,10 @@ fn test_ledger_cleanup_service() {
     solana_logger::setup();
     error!("test_ledger_cleanup_service");
     let num_nodes = 3;
-    let mut validator_config = ValidatorConfig::default();
-    validator_config.max_ledger_shreds = Some(100);
+    let validator_config = ValidatorConfig {
+        max_ledger_shreds: Some(100),
+        ..ValidatorConfig::default()
+    };
     let mut config = ClusterConfig {
         cluster_lamports: 10_000,
         poh_config: PohConfig::new_sleep(Duration::from_millis(50)),
@@ -322,8 +324,10 @@ fn run_cluster_partition<E, F>(
     assert_eq!(node_stakes.len(), num_nodes);
     let cluster_lamports = node_stakes.iter().sum::<u64>() * 2;
     let enable_partition = Arc::new(AtomicBool::new(true));
-    let mut validator_config = ValidatorConfig::default();
-    validator_config.enable_partition = Some(enable_partition.clone());
+    let mut validator_config = ValidatorConfig {
+        enable_partition: Some(enable_partition.clone()),
+        ..ValidatorConfig::default()
+    };
 
     // Returns:
     // 1) The keys for the validators
@@ -702,7 +706,7 @@ fn test_forwarding() {
 fn test_restart_node() {
     solana_logger::setup();
     error!("test_restart_node");
-    let slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH * 2 as u64;
+    let slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH * 2;
     let ticks_per_slot = 16;
     let validator_config = ValidatorConfig::default();
     let mut cluster = LocalCluster::new(&mut ClusterConfig {
@@ -779,6 +783,7 @@ fn test_mainnet_beta_cluster_type() {
         &solana_stake_program::id(),
         &solana_vote_program::id(),
         &solana_sdk::bpf_loader_deprecated::id(),
+        &solana_sdk::bpf_loader::id(),
     ]
     .iter()
     {
@@ -794,7 +799,12 @@ fn test_mainnet_beta_cluster_type() {
     }
 
     // Programs that are not available at epoch 0
-    for program_id in [&solana_sdk::bpf_loader::id(), &solana_vest_program::id()].iter() {
+    for program_id in [
+        &solana_sdk::bpf_loader_upgradeable::id(),
+        &solana_vest_program::id(),
+    ]
+    .iter()
+    {
         assert_eq!(
             (
                 program_id,
@@ -1326,8 +1336,10 @@ fn test_fake_shreds_broadcast_leader() {
 fn test_faulty_node(faulty_node_type: BroadcastStageType) {
     solana_logger::setup();
     let num_nodes = 2;
-    let mut error_validator_config = ValidatorConfig::default();
-    error_validator_config.broadcast_stage_type = faulty_node_type;
+    let error_validator_config = ValidatorConfig {
+        broadcast_stage_type: faulty_node_type,
+        ..ValidatorConfig::default()
+    };
     let mut validator_configs = Vec::with_capacity(num_nodes - 1);
     validator_configs.resize_with(num_nodes - 1, ValidatorConfig::default);
 
@@ -1339,8 +1351,8 @@ fn test_faulty_node(faulty_node_type: BroadcastStageType) {
         cluster_lamports: 10_000,
         node_stakes,
         validator_configs,
-        slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2 as u64,
-        stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2 as u64,
+        slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
+        stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
         ..ClusterConfig::default()
     };
 
@@ -1651,11 +1663,10 @@ fn test_validator_saves_tower() {
 }
 
 fn open_blockstore(ledger_path: &Path) -> Blockstore {
-    Blockstore::open_with_access_type(ledger_path, AccessType::PrimaryOnly, None).unwrap_or_else(
-        |e| {
+    Blockstore::open_with_access_type(ledger_path, AccessType::PrimaryOnly, None, true)
+        .unwrap_or_else(|e| {
             panic!("Failed to open ledger at {:?}, err: {}", ledger_path, e);
-        },
-    )
+        })
 }
 
 fn purge_slots(blockstore: &Blockstore, start_slot: Slot, slot_count: Slot) {
@@ -1875,6 +1886,7 @@ fn do_test_optimistic_confirmation_violation_with_or_without_tower(with_tower: b
                 &val_a_ledger_path,
                 AccessType::TryPrimaryThenSecondary,
                 None,
+                true,
             )
             .unwrap();
             let mut ancestors = AncestorIterator::new(last_vote, &blockstore);
@@ -2156,7 +2168,7 @@ fn test_run_test_load_program_accounts_partition_root() {
 
 fn run_test_load_program_accounts_partition(scan_commitment: CommitmentConfig) {
     let num_slots_per_validator = 8;
-    let partitions: [&[usize]; 2] = [&[(1 as usize)], &[(1 as usize)]];
+    let partitions: [&[usize]; 2] = [&[(1)], &[(1)]];
     let (leader_schedule, validator_keys) =
         create_custom_leader_schedule(partitions.len(), num_slots_per_validator);
 

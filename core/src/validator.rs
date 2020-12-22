@@ -62,11 +62,10 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process,
     sync::atomic::{AtomicBool, Ordering},
     sync::mpsc::Receiver,
     sync::{mpsc::channel, Arc, Mutex, RwLock},
-    thread::{sleep, Result},
+    thread::sleep,
     time::Duration,
 };
 
@@ -80,6 +79,7 @@ pub struct ValidatorConfig {
     pub expected_shred_version: Option<u16>,
     pub voting_disabled: bool,
     pub account_paths: Vec<PathBuf>,
+    pub account_shrink_paths: Option<Vec<PathBuf>>,
     pub rpc_config: JsonRpcConfig,
     pub rpc_addrs: Option<(SocketAddr, SocketAddr)>, // (JsonRpc, JsonRpcPubSub)
     pub pubsub_config: PubSubConfig,
@@ -87,6 +87,7 @@ pub struct ValidatorConfig {
     pub max_ledger_shreds: Option<u64>,
     pub broadcast_stage_type: BroadcastStageType,
     pub enable_partition: Option<Arc<AtomicBool>>,
+    pub enforce_ulimit_nofile: bool,
     pub fixed_leader_schedule: Option<FixedSchedule>,
     pub wait_for_supermajority: Option<Slot>,
     pub new_hard_forks: Option<Vec<Slot>>,
@@ -105,6 +106,9 @@ pub struct ValidatorConfig {
     pub require_tower: bool,
     pub debug_keys: Option<Arc<HashSet<Pubkey>>>,
     pub contact_debug_interval: u64,
+    pub bpf_jit: bool,
+    pub send_transaction_retry_ms: u64,
+    pub send_transaction_leader_forward_count: u64,
 }
 
 impl Default for ValidatorConfig {
@@ -117,12 +121,14 @@ impl Default for ValidatorConfig {
             voting_disabled: false,
             max_ledger_shreds: None,
             account_paths: Vec::new(),
+            account_shrink_paths: None,
             rpc_config: JsonRpcConfig::default(),
             rpc_addrs: None,
             pubsub_config: PubSubConfig::default(),
             snapshot_config: None,
             broadcast_stage_type: BroadcastStageType::Standard,
             enable_partition: None,
+            enforce_ulimit_nofile: true,
             fixed_leader_schedule: None,
             wait_for_supermajority: None,
             new_hard_forks: None,
@@ -141,6 +147,9 @@ impl Default for ValidatorConfig {
             require_tower: false,
             debug_keys: None,
             contact_debug_interval: DEFAULT_CONTACT_DEBUG_INTERVAL,
+            bpf_jit: false,
+            send_transaction_retry_ms: 2000,
+            send_transaction_leader_forward_count: 2,
         }
     }
 }
@@ -197,6 +206,15 @@ pub struct Validator {
     ip_echo_server: solana_net_utils::IpEchoServer,
 }
 
+// in the distant future, get rid of ::new()/exit() and use Result properly...
+fn abort() -> ! {
+    #[cfg(not(test))]
+    std::process::exit(1);
+
+    #[cfg(test)]
+    panic!("process::exit(1) is intercepted for friendly test failure...");
+}
+
 impl Validator {
     pub fn new(
         mut node: Node,
@@ -238,7 +256,7 @@ impl Validator {
                 "ledger directory does not exist or is not accessible: {:?}",
                 ledger_path
             );
-            process::exit(1);
+            abort();
         }
 
         if let Some(shred_version) = config.expected_shred_version {
@@ -255,6 +273,11 @@ impl Validator {
         let mut start = Measure::start("clean_accounts_paths");
         for accounts_path in &config.account_paths {
             cleanup_accounts_path(accounts_path);
+        }
+        if let Some(ref shrink_paths) = config.account_shrink_paths {
+            for accounts_path in shrink_paths {
+                cleanup_accounts_path(accounts_path);
+            }
         }
         start.stop();
         info!("done. {}", start);
@@ -290,10 +313,14 @@ impl Validator {
             ledger_path,
             config.poh_verify,
             &exit,
+            config.enforce_ulimit_nofile,
         );
 
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
         let bank = bank_forks.working_bank();
+        if let Some(ref shrink_paths) = config.account_shrink_paths {
+            bank.set_shrink_paths(shrink_paths.clone());
+        }
         let bank_forks = Arc::new(RwLock::new(bank_forks));
 
         let sample_performance_service =
@@ -329,7 +356,7 @@ impl Validator {
                     "shred version mismatch: expected {} found: {}",
                     expected_shred_version, node.info.shred_version,
                 );
-                process::exit(1);
+                abort();
             }
         }
 
@@ -420,6 +447,8 @@ impl Validator {
                         config.trusted_validators.clone(),
                         rpc_override_health_check.clone(),
                         optimistically_confirmed_bank.clone(),
+                        config.send_transaction_retry_ms,
+                        config.send_transaction_leader_forward_count,
                     ),
                     pubsub_service: PubSubService::new(
                         config.pubsub_config.clone(),
@@ -480,6 +509,13 @@ impl Validator {
 
         let (snapshot_packager_service, snapshot_config_and_package_sender) =
             if let Some(snapshot_config) = config.snapshot_config.clone() {
+                if is_snapshot_config_invalid(
+                    snapshot_config.snapshot_interval_slots,
+                    config.accounts_hash_interval_slots,
+                ) {
+                    error!("Snapshot config is invalid");
+                }
+
                 // Start a snapshot packaging service
                 let (sender, receiver) = channel();
                 let snapshot_packager_service =
@@ -493,7 +529,7 @@ impl Validator {
             };
 
         if wait_for_supermajority(config, &bank, &cluster_info, rpc_override_health_check) {
-            std::process::exit(1);
+            abort();
         }
 
         let poh_service = PohService::new(poh_recorder.clone(), &poh_config, &exit);
@@ -618,9 +654,9 @@ impl Validator {
         }
     }
 
-    pub fn close(mut self) -> Result<()> {
+    pub fn close(mut self) {
         self.exit();
-        self.join()
+        self.join();
     }
 
     fn print_node_info(node: &Node) {
@@ -648,7 +684,7 @@ impl Validator {
         );
     }
 
-    pub fn join(self) -> Result<()> {
+    pub fn join(self) {
         self.poh_service.join().expect("poh_service");
         drop(self.poh_recorder);
         if let Some(RpcServices {
@@ -701,8 +737,6 @@ impl Validator {
             .join()
             .expect("completed_data_sets_service");
         self.ip_echo_server.shutdown_now();
-
-        Ok(())
     }
 }
 
@@ -775,7 +809,7 @@ fn post_process_restored_tower(
                     "And there is an existing vote_account containing actual votes. \
                      Aborting due to possible conflicting duplicate votes",
                 );
-                process::exit(1);
+                abort();
             }
             if err.is_file_missing() && !voting_has_been_active {
                 // Currently, don't protect against spoofed snapshots with no tower at all
@@ -807,6 +841,7 @@ fn new_banks_from_ledger(
     ledger_path: &Path,
     poh_verify: bool,
     exit: &Arc<AtomicBool>,
+    enforce_ulimit_nofile: bool,
 ) -> (
     GenesisConfig,
     BankForks,
@@ -835,7 +870,7 @@ fn new_banks_from_ledger(
         if genesis_hash != expected_genesis_hash {
             error!("genesis hash mismatch: expected {}", expected_genesis_hash);
             error!("Delete the ledger directory to continue: {:?}", ledger_path);
-            process::exit(1);
+            abort();
         }
     }
 
@@ -844,19 +879,24 @@ fn new_banks_from_ledger(
         ledger_signal_receiver,
         completed_slots_receiver,
         ..
-    } = Blockstore::open_with_signal(ledger_path, config.wal_recovery_mode.clone())
-        .expect("Failed to open ledger database");
+    } = Blockstore::open_with_signal(
+        ledger_path,
+        config.wal_recovery_mode.clone(),
+        enforce_ulimit_nofile,
+    )
+    .expect("Failed to open ledger database");
     blockstore.set_no_compaction(config.no_rocksdb_compaction);
 
     let restored_tower = Tower::restore(ledger_path, &validator_identity);
     if let Ok(tower) = &restored_tower {
         reconcile_blockstore_roots_with_tower(&tower, &blockstore).unwrap_or_else(|err| {
             error!("Failed to reconcile blockstore with tower: {:?}", err);
-            std::process::exit(1);
+            abort()
         });
     }
 
     let process_options = blockstore_processor::ProcessOptions {
+        bpf_jit: config.bpf_jit,
         poh_verify,
         dev_halt_at_slot: config.dev_halt_at_slot,
         new_hard_forks: config.new_hard_forks.clone(),
@@ -877,6 +917,7 @@ fn new_banks_from_ledger(
         &genesis_config,
         &blockstore,
         config.account_paths.clone(),
+        config.account_shrink_paths.clone(),
         config.snapshot_config.as_ref(),
         process_options,
         transaction_history_services
@@ -885,7 +926,7 @@ fn new_banks_from_ledger(
     )
     .unwrap_or_else(|err| {
         error!("Failed to load ledger: {:?}", err);
-        process::exit(1);
+        abort()
     });
 
     let tower = post_process_restored_tower(
@@ -1107,7 +1148,7 @@ unsafe fn check_avx() {
         error!(
             "Your machine does not have AVX support, please rebuild from source on your machine"
         );
-        process::exit(1);
+        abort();
     }
 }
 
@@ -1124,10 +1165,10 @@ fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: boo
     let my_shred_version = cluster_info.my_shred_version();
     let my_id = cluster_info.id();
 
-    for (activated_stake, vote_account) in bank.vote_accounts().values() {
+    for (_, (activated_stake, vote_account)) in bank.vote_accounts() {
         total_activated_stake += activated_stake;
 
-        if *activated_stake == 0 {
+        if activated_stake == 0 {
             continue;
         }
         let vote_state_node_pubkey = vote_account
@@ -1149,13 +1190,13 @@ fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: boo
                 online_stake += activated_stake;
             } else {
                 wrong_shred_stake += activated_stake;
-                wrong_shred_nodes.push((*activated_stake, vote_state_node_pubkey));
+                wrong_shred_nodes.push((activated_stake, vote_state_node_pubkey));
             }
         } else if vote_state_node_pubkey == my_id {
             online_stake += activated_stake; // This node is online
         } else {
             offline_stake += activated_stake;
-            offline_nodes.push((*activated_stake, vote_state_node_pubkey));
+            offline_nodes.push((activated_stake, vote_state_node_pubkey));
         }
     }
 
@@ -1207,6 +1248,15 @@ fn cleanup_accounts_path(account_path: &std::path::Path) {
     }
 }
 
+pub fn is_snapshot_config_invalid(
+    snapshot_interval_slots: u64,
+    accounts_hash_interval_slots: u64,
+) -> bool {
+    snapshot_interval_slots != 0
+        && (snapshot_interval_slots < accounts_hash_interval_slots
+            || snapshot_interval_slots % accounts_hash_interval_slots != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,7 +1290,7 @@ mod tests {
             Some(&leader_node.info),
             &config,
         );
-        validator.close().unwrap();
+        validator.close();
         remove_dir_all(validator_ledger_path).unwrap();
     }
 
@@ -1318,7 +1368,7 @@ mod tests {
         // While join is called sequentially, the above exit call notified all the
         // validators to exit from all their threads
         validators.into_iter().for_each(|validator| {
-            validator.join().unwrap();
+            validator.join();
         });
 
         for path in ledger_paths {
@@ -1376,5 +1426,14 @@ mod tests {
             &cluster_info,
             rpc_override_health_check
         ));
+    }
+
+    #[test]
+    fn test_interval_check() {
+        assert!(!is_snapshot_config_invalid(0, 100));
+        assert!(is_snapshot_config_invalid(1, 100));
+        assert!(is_snapshot_config_invalid(230, 100));
+        assert!(!is_snapshot_config_invalid(500, 100));
+        assert!(!is_snapshot_config_invalid(5, 5));
     }
 }
