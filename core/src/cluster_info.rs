@@ -69,8 +69,11 @@ use std::{
     cmp::min,
     collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
+    fs::{self, File},
+    io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     ops::{Deref, DerefMut},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     thread::{sleep, Builder, JoinHandle},
@@ -107,7 +110,8 @@ const MAX_PRUNE_DATA_NODES: usize = 32;
 const GOSSIP_PING_TOKEN_SIZE: usize = 32;
 const GOSSIP_PING_CACHE_CAPACITY: usize = 16384;
 const GOSSIP_PING_CACHE_TTL: Duration = Duration::from_secs(640);
-pub const DEFAULT_CONTACT_DEBUG_INTERVAL: u64 = 10_000;
+pub const DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS: u64 = 10_000;
+pub const DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS: u64 = 60_000;
 /// Minimum serialized size of a Protocol::PullResponse packet.
 const PULL_RESPONSE_MIN_SERIALIZED_SIZE: usize = 167;
 
@@ -301,8 +305,10 @@ pub struct ClusterInfo {
     stats: GossipStats,
     socket: UdpSocket,
     local_message_pending_push_queue: RwLock<Vec<(CrdsValue, u64)>>,
-    contact_debug_interval: u64,
+    contact_debug_interval: u64, // milliseconds, 0 = disabled
+    contact_save_interval: u64,  // milliseconds, 0 = disabled
     instance: NodeInstance,
+    contact_info_path: PathBuf,
 }
 
 impl Default for ClusterInfo {
@@ -558,8 +564,10 @@ impl ClusterInfo {
             stats: GossipStats::default(),
             socket: UdpSocket::bind("0.0.0.0:0").unwrap(),
             local_message_pending_push_queue: RwLock::new(vec![]),
-            contact_debug_interval: DEFAULT_CONTACT_DEBUG_INTERVAL,
+            contact_debug_interval: DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS,
             instance: NodeInstance::new(&mut thread_rng(), id, timestamp()),
+            contact_info_path: PathBuf::default(),
+            contact_save_interval: 0, // disabled
         };
         {
             let mut gossip = me.gossip.write().unwrap();
@@ -595,6 +603,8 @@ impl ClusterInfo {
             ),
             contact_debug_interval: self.contact_debug_interval,
             instance: NodeInstance::new(&mut thread_rng(), *new_id, timestamp()),
+            contact_info_path: PathBuf::default(),
+            contact_save_interval: 0, // disabled
         }
     }
 
@@ -651,6 +661,87 @@ impl ClusterInfo {
 
     pub fn set_entrypoints(&self, entrypoints: Vec<ContactInfo>) {
         *self.entrypoints.write().unwrap() = entrypoints;
+    }
+
+    pub fn save_contact_info(&self) {
+        let gossip = self.gossip.read().unwrap();
+        let nodes = gossip
+            .crds
+            .get_nodes()
+            .map(|v| v.value.clone())
+            .collect::<Vec<_>>();
+
+        let filename = self.contact_info_path.join("contact-info");
+        let new_filename = &filename.with_extension("tmp");
+
+        match File::create(&new_filename) {
+            Ok(mut file) => {
+                if let Err(err) = bincode::serialize_into(&mut file, &nodes) {
+                    warn!(
+                        "Failed to serialize contact info info {}: {}",
+                        new_filename.display(),
+                        err
+                    );
+                    return;
+                }
+            }
+            Err(err) => {
+                warn!("Failed to create {}: {}", new_filename.display(), err);
+                return;
+            }
+        }
+
+        match fs::rename(&new_filename, &filename) {
+            Ok(()) => {
+                info!(
+                    "Saved contact info for {} nodes into {}",
+                    nodes.len(),
+                    filename.display()
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to rename {} to {}: {}",
+                    new_filename.display(),
+                    filename.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    pub fn restore_contact_info(&mut self, contact_info_path: &Path, contact_save_interval: u64) {
+        self.contact_info_path = contact_info_path.into();
+        self.contact_save_interval = contact_save_interval;
+
+        let filename = contact_info_path.join("contact-info");
+        if !filename.exists() {
+            return;
+        }
+
+        let nodes: Vec<CrdsValue> = match File::open(&filename) {
+            Ok(file) => {
+                bincode::deserialize_from(&mut BufReader::new(file)).unwrap_or_else(|err| {
+                    warn!("Failed to deserialize {}: {}", filename.display(), err);
+                    vec![]
+                })
+            }
+            Err(err) => {
+                warn!("Failed to open {}: {}", filename.display(), err);
+                vec![]
+            }
+        };
+
+        for node in nodes {
+            if let Err(err) = self.gossip.write().unwrap().crds.insert(node, timestamp()) {
+                warn!("crds insert failed {:?}", err);
+            }
+        }
+        info!(
+            "Loaded contact info for {} nodes from {}",
+            nodes.len(),
+            filename.display()
+        );
     }
 
     pub fn id(&self) -> Pubkey {
@@ -1823,6 +1914,7 @@ impl ClusterInfo {
             .spawn(move || {
                 let mut last_push = timestamp();
                 let mut last_contact_info_trace = timestamp();
+                let mut last_contact_info_save = timestamp();
                 let mut entrypoints_processed = false;
                 let recycler = PacketsRecycler::default();
                 let crds_data = vec![
@@ -1840,13 +1932,20 @@ impl ClusterInfo {
                     if self.contact_debug_interval != 0
                         && start - last_contact_info_trace > self.contact_debug_interval
                     {
-                        // Log contact info every 10 seconds
+                        // Log contact info
                         info!(
                             "\n{}\n\n{}",
                             self.contact_info_trace(),
                             self.rpc_info_trace()
                         );
                         last_contact_info_trace = start;
+                    }
+
+                    if self.contact_save_interval != 0
+                        && start - last_contact_info_save > self.contact_save_interval
+                    {
+                        self.save_contact_info();
+                        last_contact_info_save = start;
                     }
 
                     let stakes: HashMap<_, _> = match bank_forks {
