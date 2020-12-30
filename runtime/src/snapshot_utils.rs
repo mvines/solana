@@ -272,8 +272,11 @@ pub fn archive_snapshot_package(snapshot_package: &AccountsPackage) -> Result<()
     )?;
 
     // Add the AppendVecs into the compressible list
+    error!("Add the AppendVecs into the compressible list");
     for storage in snapshot_package.storages.iter().flatten() {
+        error!("storage");
         storage.flush()?;
+        error!("storage post-flush");
         let storage_path = storage.get_path();
         let output_path =
             staging_accounts_dir.join(crate::append_vec::AppendVec::new_relative_path(
@@ -285,11 +288,14 @@ pub fn archive_snapshot_package(snapshot_package: &AccountsPackage) -> Result<()
         // `output_path` - The directory where the AppendVec will be placed in the staging directory.
         let storage_path =
             fs::canonicalize(storage_path).expect("Could not get absolute path for accounts");
-        symlink::symlink_dir(storage_path, &output_path)?;
+        error!("storage path {} -> {}", storage.display(), output_path.display());
+        symlink::symlink_file(storage_path, &output_path)?;
+        error!("storage path symlink");
         if !output_path.is_file() {
             return Err(SnapshotError::StoragePathSymlinkInvalid);
         }
     }
+    error!("Write version file");
 
     // Write version file
     {
