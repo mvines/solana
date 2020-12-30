@@ -641,6 +641,10 @@ pub fn bank_from_archive<P: AsRef<Path>>(
     measure.stop();
     info!("{}", measure);
 
+
+    /*
+    // TODO: Why the `move_items!'next lines?!?!?
+
     // Move the unpacked snapshots into `snapshot_path`
     let dir_files = fs::read_dir(&unpacked_snapshots_dir).unwrap_or_else(|err| {
         panic!(
@@ -654,6 +658,8 @@ pub fn bank_from_archive<P: AsRef<Path>>(
     let mut copy_options = CopyOptions::new();
     copy_options.overwrite = true;
     fs_extra::move_items(&paths, &snapshot_path, &copy_options)?;
+    error!("mjv: why move_items into {}: {:?}", snapshot_path.display(), paths);
+    */
 
     Ok(bank)
 }
@@ -788,7 +794,7 @@ fn rebuild_bank_from_snapshots<P>(
     account_paths: &[PathBuf],
     frozen_account_pubkeys: &[Pubkey],
     unpacked_snapshots_dir: &PathBuf,
-    append_vecs_path: P,
+    unpacked_accounts_dir: P,
     genesis_config: &GenesisConfig,
     debug_keys: Option<Arc<HashSet<Pubkey>>>,
     additional_builtins: Option<&Builtins>,
@@ -813,13 +819,18 @@ where
         .pop()
         .ok_or_else(|| get_io_error("No snapshots found in snapshots directory"))?;
 
-    info!("Loading bank from {:?}", &root_paths.snapshot_file_path);
+
+
+    // TODO: learn now unpacked_accounts_dir is handled!!!
+    // TODO: learn now unpacked_accounts_dir is handled!!!
+
+    info!("Loading bank from {}", &root_paths.snapshot_file_path.display());
     let bank = deserialize_snapshot_data_file(&root_paths.snapshot_file_path, |mut stream| {
         Ok(match snapshot_version_enum {
             SnapshotVersion::V1_2_0 => bank_from_stream(
                 SerdeStyle::NEWER,
                 &mut stream,
-                &append_vecs_path,
+                &unpacked_accounts_dir,
                 account_paths,
                 genesis_config,
                 frozen_account_pubkeys,
@@ -831,7 +842,7 @@ where
 
     let status_cache_path = unpacked_snapshots_dir.join(SNAPSHOT_STATUS_CACHE_FILE_NAME);
     let slot_deltas = deserialize_snapshot_data_file(&status_cache_path, |stream| {
-        info!("Rebuilding status cache...");
+        info!("Rebuilding status cache from {}...", status_cache_path.display());
         let slot_deltas: Vec<BankSlotDelta> = bincode::options()
             .with_limit(MAX_SNAPSHOT_DATA_FILE_SIZE)
             .with_fixint_encoding()
