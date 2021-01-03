@@ -11,9 +11,7 @@ use {
         rent_collector::RentCollector,
         stakes::Stakes,
     },
-    bincode,
-    bincode::{config::Options, Error},
-    fs_extra::dir::CopyOptions,
+    bincode::{self, config::Options, Error},
     log::{info, warn},
     rand::{thread_rng, Rng},
     serde::{de::DeserializeOwned, Deserialize, Serialize},
@@ -262,7 +260,7 @@ where
 fn reconstruct_accountsdb_from_fields<E, P>(
     accounts_db_fields: AccountsDbFields<E>,
     account_paths: &[PathBuf],
-    stream_append_vecs_path: P,
+    snapshot_append_vecs_path: P,
     cluster_type: &ClusterType,
     account_indexes: HashSet<AccountIndex>,
 ) -> Result<AccountsDB, Error>
@@ -317,14 +315,15 @@ where
                 // at by `local_dir`
                 let append_vec_relative_path =
                     AppendVec::new_relative_path(slot, storage_entry.append_vec_id());
-                let append_vec_abs_path = stream_append_vecs_path
+                let append_vec_abs_path = snapshot_append_vecs_path
                     .as_ref()
                     .join(&append_vec_relative_path);
                 let target = local_dir.join(append_vec_abs_path.file_name().unwrap());
-                std::fs::rename(append_vec_abs_path.clone(), target).or_else(|_| {
-                    let mut copy_options = CopyOptions::new();
+
+                std::fs::hard_link(&append_vec_abs_path, &target).or_else(|_| {
+                    let mut copy_options = fs_extra::file::CopyOptions::new();
                     copy_options.overwrite = true;
-                    fs_extra::move_items(&vec![&append_vec_abs_path], &local_dir, &copy_options)
+                    fs_extra::file::copy(append_vec_abs_path, target, &copy_options)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
                         .and(Ok(()))
                 })?;
