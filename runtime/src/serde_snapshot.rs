@@ -12,7 +12,7 @@ use {
         stakes::Stakes,
     },
     bincode::{self, config::Options, Error},
-    log::{info, warn},
+    log::*,
     rand::{thread_rng, Rng},
     serde::{de::DeserializeOwned, Deserialize, Serialize},
     solana_sdk::{
@@ -27,6 +27,7 @@ use {
         pubkey::Pubkey,
     },
     std::{
+        fs,
         collections::{HashMap, HashSet},
         io::{BufReader, BufWriter, Read, Write},
         path::{Path, PathBuf},
@@ -236,6 +237,7 @@ where
     E: Into<AccountStorageEntry>,
     P: AsRef<Path>,
 {
+    error!("reconstruct_bank_from_fields 1");
     let mut accounts_db = reconstruct_accountsdb_from_fields(
         accounts_db_fields,
         account_paths,
@@ -243,7 +245,9 @@ where
         &genesis_config.cluster_type,
         account_indexes,
     )?;
+    error!("reconstruct_bank_from_fields 2");
     accounts_db.freeze_accounts(&bank_fields.ancestors, frozen_account_pubkeys);
+    error!("reconstruct_bank_from_fields 3");
 
     let bank_rc = BankRc::new(Accounts::new_empty(accounts_db), bank_fields.slot);
     let bank = Bank::new_from_fields(
@@ -253,8 +257,46 @@ where
         debug_keys,
         additional_builtins,
     );
+    error!("reconstruct_bank_from_fields 4");
 
     Ok(bank)
+}
+
+// Hardlink src_file to dst_file if possible, otherwise copy
+pub(crate) fn hard_link_else_copy<P: AsRef<Path>, Q: AsRef<Path>>(
+    src_file: P,
+    dst_file: Q,
+) -> std::io::Result<()> {
+    error!("hard_link {:?} to {:?}", src_file.as_ref(), dst_file.as_ref());
+    assert!(src_file.as_ref().exists());
+
+
+    // OK?
+    // fs::copy(&src_file, &dst_file)?;
+
+    // PROBLEM?
+    if let Err(err) = fs::hard_link(&src_file, &dst_file) {
+        error!("hard_link MUST COPY due to {:?}: {:?} to {:?}", err, src_file.as_ref(), dst_file.as_ref());
+        fs::copy(&src_file, &dst_file)?;
+    } else {
+        error!("OK!");
+    }
+    //END PROBLEM
+
+
+    error!("exists? {:?}", dst_file.as_ref().exists());
+    error!("exists? {:?}", fs::canonicalize(dst_file));
+    //panic!("boom");
+    Ok(())
+        /*
+    .or_else(|err| {
+    fs::hard_link(&src_file, &dst_file).or_else(|err| {
+        error!("hard_link failed with {:?}", err);
+        fs::copy(src_file, dst_file)
+//            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+//            .and(Ok(()))
+    })
+    */
 }
 
 fn reconstruct_accountsdb_from_fields<E, P>(
@@ -288,13 +330,15 @@ where
 
     // Ensure all account paths exist
     for path in &accounts_db.paths {
-        std::fs::create_dir_all(path)
+        error!("create_dir_all: {}", path.display());
+        fs::create_dir_all(path)
             .unwrap_or_else(|err| panic!("Failed to create directory {}: {}", path.display(), err));
     }
 
     let mut last_log_update = Instant::now();
     let mut remaining_slots_to_process = storage.len();
 
+    error!("Remap the deserialized AppendVec paths to point to correct local paths");
     // Remap the deserialized AppendVec paths to point to correct local paths
     let mut storage = storage
         .into_iter()
@@ -308,6 +352,7 @@ where
 
             let mut new_slot_storage = HashMap::new();
             for (id, storage_entry) in slot_storage.drain() {
+                error!("slot_storage: {:?} -> {:?}", id, storage_entry);
                 let path_index = thread_rng().gen_range(0, accounts_db.paths.len());
                 let local_dir = &accounts_db.paths[path_index];
 
@@ -320,28 +365,32 @@ where
                     .join(&append_vec_relative_path);
                 let target = local_dir.join(append_vec_abs_path.file_name().unwrap());
 
-                std::fs::hard_link(&append_vec_abs_path, &target).or_else(|_| {
-                    let mut copy_options = fs_extra::file::CopyOptions::new();
-                    copy_options.overwrite = true;
-                    fs_extra::file::copy(append_vec_abs_path, target, &copy_options)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                        .and(Ok(()))
-                })?;
+                error!("hard_link_else_copy({:?}, {:?})", append_vec_abs_path, target);
+                //hard_link_else_copy(&append_vec_abs_path, &target)?;
+                hard_link_else_copy(&append_vec_abs_path, &target).unwrap(); // TODO: NO UNwRAP
+                error!("post hard_link_else_copy");
 
                 // Notify the AppendVec of the new file location
                 let local_path = local_dir.join(append_vec_relative_path);
                 let mut u_storage_entry = Arc::try_unwrap(storage_entry).unwrap();
-                u_storage_entry.set_file(local_path)?;
+                error!("set_file to {:?}", local_path);
+                u_storage_entry.set_file(local_path).unwrap();
+                //u_storage_entry.set_file(local_path)?;
+                error!("slot_storage: FINAL {:?} -> {:?}", id, u_storage_entry);
                 new_slot_storage.insert(id, Arc::new(u_storage_entry));
             }
             Ok((slot, new_slot_storage))
         })
         .collect::<Result<HashMap<Slot, _>, Error>>()?;
 
+    error!("storage len={}", storage.len());
+
     // discard any slots with no storage entries
     // this can happen if a non-root slot was serialized
     // but non-root stores should not be included in the snapshot
     storage.retain(|_slot, stores| !stores.is_empty());
+
+    error!("storage post retain len={}", storage.len());
 
     accounts_db
         .bank_hashes
@@ -349,6 +398,7 @@ where
         .unwrap()
         .insert(slot, bank_hash_info);
 
+    error!("Process deserialized data, set necessary fields in self");
     // Process deserialized data, set necessary fields in self
     let max_id: usize = *storage
         .values()

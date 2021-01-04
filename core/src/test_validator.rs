@@ -338,6 +338,7 @@ impl TestValidator {
         let tpu = node.info.tpu;
         let gossip = node.info.gossip;
 
+        let snapshot_interval_slots = 100;
         let validator_config = ValidatorConfig {
             rpc_addrs: Some((
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), node.info.rpc.port()),
@@ -347,14 +348,14 @@ impl TestValidator {
                 ),
             )),
             rpc_config: config.rpc_config.clone(),
-            accounts_hash_interval_slots: 100,
+            accounts_hash_interval_slots: snapshot_interval_slots,
             account_paths: vec![ledger_path.join("accounts")],
             poh_verify: false, // Skip PoH verification of ledger on startup for speed
             snapshot_config: Some(SnapshotConfig {
-                snapshot_interval_slots: 100,
+                snapshot_interval_slots,
                 snapshot_path: ledger_path.join("snapshot"),
                 snapshot_package_output_path: ledger_path.to_path_buf(),
-                compression: CompressionType::NoCompression,
+                compression: CompressionType::NoArchive,
                 snapshot_version: SnapshotVersion::default(),
             }),
             enforce_ulimit_nofile: false,

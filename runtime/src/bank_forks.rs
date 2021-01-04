@@ -23,6 +23,7 @@ pub enum CompressionType {
     Gzip,
     Zstd,
     NoCompression,
+    NoArchive,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

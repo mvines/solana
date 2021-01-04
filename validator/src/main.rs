@@ -1361,7 +1361,7 @@ pub fn main() {
         .arg(
             Arg::with_name("snapshot_compression")
                 .long("snapshot-compression")
-                .possible_values(&["bz2", "gzip", "zstd", "none"])
+                .possible_values(&["bz2", "gzip", "zstd", "tar", "none"])
                 .default_value("zstd")
                 .value_name("COMPRESSION_TYPE")
                 .takes_value(true)
@@ -1676,7 +1676,8 @@ pub fn main() {
             "bz2" => CompressionType::Bzip2,
             "gzip" => CompressionType::Gzip,
             "zstd" => CompressionType::Zstd,
-            "none" => CompressionType::NoCompression,
+            "tar" => CompressionType::NoCompression,
+            "none" => CompressionType::NoArchive,
             _ => panic!("Compression type not recognized: {}", compression_str),
         }
     };
