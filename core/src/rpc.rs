@@ -275,7 +275,9 @@ impl JsonRpcRequestProcessor {
         let encoding = config.encoding.unwrap_or(UiAccountEncoding::Binary);
         check_slice_and_encoding(&encoding, config.data_slice.is_some())?;
 
+        debug!("get_account_info for {}", pubkey);
         let response = get_encoded_account(&bank, pubkey, encoding, config.data_slice)?;
+        debug!("get_account_info for {} success", pubkey);
         Ok(new_response(&bank, response))
     }
 
@@ -484,7 +486,9 @@ impl JsonRpcRequestProcessor {
     }
 
     fn get_transaction_count(&self, commitment: Option<CommitmentConfig>) -> u64 {
-        self.bank(commitment).transaction_count() as u64
+        let i = self.bank(commitment).transaction_count() as u64;
+        debug!("get_transaction_count rpc request handled: {}", i);
+        i
     }
 
     fn get_total_supply(&self, commitment: Option<CommitmentConfig>) -> u64 {
@@ -2217,7 +2221,10 @@ impl RpcSol for RpcSolImpl {
     ) -> Result<EpochInfo> {
         debug!("get_epoch_info rpc request received");
         let bank = meta.bank(commitment);
-        Ok(bank.get_epoch_info())
+        let i = Ok(bank.get_epoch_info());
+
+        debug!("get_epoch_info rpc request handled: {:?}", i);
+        i
     }
 
     fn get_block_commitment(
@@ -2556,18 +2563,22 @@ impl RpcSol for RpcSolImpl {
 
     fn get_identity(&self, meta: Self::Metadata) -> Result<RpcIdentity> {
         debug!("get_identity rpc request received");
-        Ok(RpcIdentity {
+        let i = Ok(RpcIdentity {
             identity: meta.config.identity_pubkey.to_string(),
-        })
+        });
+        debug!("get_identity rpc request handled: {:?}", i);
+        i
     }
 
     fn get_version(&self, _: Self::Metadata) -> Result<RpcVersionInfo> {
         debug!("get_version rpc request received");
         let version = solana_version::Version::default();
-        Ok(RpcVersionInfo {
+        let v = Ok(RpcVersionInfo {
             solana_core: version.to_string(),
             feature_set: Some(version.feature_set),
-        })
+        });
+        debug!("get_version rpc request handled");
+        v
     }
 
     fn set_log_filter(&self, meta: Self::Metadata, filter: String) -> Result<()> {

@@ -168,7 +168,7 @@ impl RpcRequestMiddleware {
 
 impl RequestMiddleware for RpcRequestMiddleware {
     fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction {
-        trace!("request uri: {}", request.uri());
+        info!("request uri: {}", request.uri());
 
         if let Some(ref snapshot_config) = self.snapshot_config {
             if request.uri().path() == "/snapshot.tar.bz2" {
@@ -209,6 +209,23 @@ impl RequestMiddleware for RpcRequestMiddleware {
             }
         } else if self.is_file_get_path(request.uri().path()) {
             self.process_file_get(request.uri().path())
+        } else if request.uri().path().starts_with("/404") {
+            error!("404: {}", request.uri());
+            RequestMiddlewareAction::Respond {
+                should_validate_hosts: true,
+                response: Box::new(jsonrpc_core::futures::future::ok(RpcRequestMiddleware::not_found())),
+            }
+        } else if request.uri().path().starts_with("/hi") {
+            error!("HI: {}", request.uri());
+            RequestMiddlewareAction::Respond {
+                should_validate_hosts: true,
+                response: Box::new(jsonrpc_core::futures::future::ok(
+                    hyper::Response::builder()
+                        .status(hyper::StatusCode::OK)
+                        .body(hyper::Body::from("hi"))
+                        .unwrap(),
+                )),
+            }
         } else if request.uri().path() == "/health" {
             RequestMiddlewareAction::Respond {
                 should_validate_hosts: true,
