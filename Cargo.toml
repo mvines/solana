@@ -75,3 +75,11 @@ members = [
 exclude = [
     "programs/bpf",
 ]
+
+[patch.crates-io]
+jsonrpc-core = { path = "/Users/mvines/ws/jsonrpc/core" }
+jsonrpc-http-server  = { path = "/Users/mvines/ws/jsonrpc/http" }
+jsonrpc-core-client = { path = "/Users/mvines/ws/jsonrpc/core-client" }
+jsonrpc-derive = { path = "/Users/mvines/ws/jsonrpc/derive" }
+jsonrpc-pubsub = { path = "/Users/mvines/ws/jsonrpc/pubsub" }
+jsonrpc-ws-server = { path = "/Users/mvines/ws/jsonrpc/ws" }
