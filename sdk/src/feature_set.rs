@@ -48,6 +48,26 @@ pub mod full_inflation {
             solana_sdk::declare_id!("DummyEnab1eAddress1111111111111111111111111");
         }
     }
+
+    pub mod my_name {
+        pub mod vote {
+            // TODO: Contact the Solana Foundation by emailing nominations@solana.foundation and
+            // replace "MyVoteAddress111111111111111111111111111111" with the pubkey provided to
+            // you.
+            //
+            // Once completed remove this TODO comment
+            solana_sdk::declare_id!("MyVoteAddress111111111111111111111111111111");
+        }
+        pub mod enable {
+            // TODO: Run `solana-keygen new -o inflation.json` and replace
+            //       "MyEnab1eAddress1111111111111111111111111111" with your pubkey.
+            //       Be sure you copy the pubkey correctly or you won't be able to enable
+            //       inflation.
+            //
+            // Once completed remove this TODO comment
+            solana_sdk::declare_id!("MyEnab1eAddress1111111111111111111111111111");
+        }
+    }
 }
 
 pub mod spl_token_v2_multisig_fix {
@@ -206,6 +226,8 @@ lazy_static! {
         (prevent_upgrade_and_invoke::id(), "Prevent upgrade and invoke in same tx batch"),
         (full_inflation::candidate_example::vote::id(), "Community vote allowing candidate_example to enable full inflation"),
         (full_inflation::candidate_example::enable::id(), "Full inflation enabled by candidate_example"),
+        (full_inflation::my_name::vote::id(), "Community vote allowing my_name to enable full inflation"),
+        (full_inflation::my_name::enable::id(), "Full inflation enabled by my_name"),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()
@@ -236,6 +258,10 @@ lazy_static! {
         FullInflationFeaturePair {
             vote_id: full_inflation::candidate_example::vote::id(),
             enable_id: full_inflation::candidate_example::enable::id(),
+        },
+        FullInflationFeaturePair {
+            vote_id: full_inflation::my_name::vote::id(),
+            enable_id: full_inflation::my_name::enable::id(),
         },
     ]
     .iter()
