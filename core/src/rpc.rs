@@ -386,8 +386,9 @@ impl JsonRpcRequestProcessor {
         pubkey: &Pubkey,
         commitment: Option<CommitmentConfig>,
     ) -> RpcResponse<u64> {
+        error!("get_balance!");
         let bank = self.bank(commitment);
-        new_response(&bank, bank.get_balance(pubkey))
+        dbg!(new_response(&bank, bank.get_balance(pubkey)))
     }
 
     fn get_recent_blockhash(
@@ -3174,6 +3175,8 @@ pub mod tests {
 
     #[test]
     fn test_rpc_get_balance_via_client() {
+        solana_logger::setup();
+
         let genesis = create_genesis_config(20);
         let mint_pubkey = genesis.mint_keypair.pubkey();
         let bank = Arc::new(Bank::new(&genesis.genesis_config));
@@ -3182,13 +3185,43 @@ pub mod tests {
         let mut io = MetaIoHandler::default();
         io.extend_with(RpcSolImpl.to_delegate());
 
-        let fut = async {
+        /*
+        let fut = {
+            let (client, server) =
+                local::connect_with_metadata::<gen_client::Client, _, _>(&io, meta);
+            client
+                .get_balance(mint_pubkey.to_string(), None)
+                .join(server)
+        };
+        let (response, _) = fut.wait().unwrap();
+        */
+
+        let mut rt = tokio::runtime::Runtime::new().unwrap();
+        error!("pre block_on");
+        let (response, _) = rt.block_on(async {
+            error!("HI1");
             let (client, server) =
                 local::connect_with_metadata::<gen_client::Client, _, _>(&io, meta);
 
-            futures::join!(client.get_balance(mint_pubkey.to_string(), None), server)
-        };
-        let (response, _) = futures::executor::block_on(fut);
+            error!("HI2");
+//            let response = client.get_balance(mint_pubkey.to_string(), None).await;
+           // error!("HI3: {:?}", response);
+            //(response, true)
+            //
+
+            // TODO: wait for response then close server
+
+            let response = client.get_balance(mint_pubkey.to_string(), None).await;
+            error!("HI3: {:?}", response);  // DEAD BECAUSE server doesn't run????
+            error!("HI3: {:?}", response);  // DEAD BECAUSE server doesn't run????
+            error!("HI3: {:?}", response);  // DEAD BECAUSE server doesn't run????
+            error!("HI3: {:?}", response);  // DEAD BECAUSE server doesn't run????
+            error!("HI3: {:?}", response);  // DEAD BECAUSE server doesn't run????
+            error!("HI3: {:?}", response);  // DEAD BECAUSE server doesn't run????
+            (response, server.await)
+        });
+        //let (response, _) = rtfutures::executor::block_on(fut);
+        error!("post block_on");
         assert_eq!(response.unwrap().value, 20);
     }
 
