@@ -319,7 +319,6 @@ impl JsonRpcService {
             health.clone(),
             cluster_info.clone(),
             genesis_hash,
-            runtime,
             bigtable_ledger_storage,
             optimistically_confirmed_bank,
         );

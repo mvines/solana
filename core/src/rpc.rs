@@ -10,7 +10,7 @@ use crate::{
     validator::ValidatorExit,
 };
 use bincode::{config::Options, serialize};
-use jsonrpc_core::{types::error, Error, Metadata, Result};
+use jsonrpc_core::{futures::future, types::error, BoxFuture, Error, Metadata, Result};
 use jsonrpc_derive::rpc;
 use solana_account_decoder::{
     parse_account_data::AccountAdditionalData,
@@ -84,7 +84,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::runtime::Runtime;
 
 pub const MAX_REQUEST_PAYLOAD_SIZE: usize = 50 * (1 << 10); // 50kB
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
@@ -133,8 +132,7 @@ pub struct JsonRpcRequestProcessor {
     cluster_info: Arc<ClusterInfo>,
     genesis_hash: Hash,
     transaction_sender: Arc<Mutex<Sender<TransactionInfo>>>,
-    runtime: Arc<Runtime>,
-    bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
+    bigtable_ledger_storage: Option<Arc<solana_storage_bigtable::LedgerStorage>>,
     optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
@@ -215,7 +213,6 @@ impl JsonRpcRequestProcessor {
         health: Arc<RpcHealth>,
         cluster_info: Arc<ClusterInfo>,
         genesis_hash: Hash,
-        runtime: Arc<Runtime>,
         bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
     ) -> (Self, Receiver<TransactionInfo>) {
@@ -232,8 +229,7 @@ impl JsonRpcRequestProcessor {
                 cluster_info,
                 genesis_hash,
                 transaction_sender: Arc::new(Mutex::new(sender)),
-                runtime,
-                bigtable_ledger_storage,
+                bigtable_ledger_storage: bigtable_ledger_storage.map(Arc::new),
                 optimistically_confirmed_bank,
             },
             receiver,
@@ -269,7 +265,6 @@ impl JsonRpcRequestProcessor {
             cluster_info,
             genesis_hash,
             transaction_sender: Arc::new(Mutex::new(sender)),
-            runtime: Arc::new(Runtime::new().expect("Runtime")),
             bigtable_ledger_storage: None,
             optimistically_confirmed_bank: Arc::new(RwLock::new(OptimisticallyConfirmedBank {
                 bank: bank.clone(),
@@ -673,27 +668,11 @@ impl JsonRpcRequestProcessor {
         Ok(())
     }
 
-    fn check_bigtable_result<T>(
-        &self,
-        result: &std::result::Result<T, solana_storage_bigtable::Error>,
-    ) -> Result<()>
-    where
-        T: std::fmt::Debug,
-    {
-        if result.is_err() {
-            let err = result.as_ref().unwrap_err();
-            if let solana_storage_bigtable::Error::BlockNotFound(slot) = err {
-                return Err(RpcCustomError::LongTermStorageSlotSkipped { slot: *slot }.into());
-            }
-        }
-        Ok(())
-    }
-
     pub fn get_confirmed_block(
         &self,
         slot: Slot,
         encoding: Option<UiTransactionEncoding>,
-    ) -> Result<Option<EncodedConfirmedBlock>> {
+    ) -> BoxFuture<Result<Option<EncodedConfirmedBlock>>> {
         let encoding = encoding.unwrap_or(UiTransactionEncoding::Json);
         if self.config.enable_rpc_transaction_history
             && slot
@@ -704,24 +683,38 @@ impl JsonRpcRequestProcessor {
                     .highest_confirmed_root()
         {
             let result = self.blockstore.get_confirmed_block(slot);
-            self.check_blockstore_root(&result, slot)?;
+            if let Err(err) = self.check_blockstore_root(&result, slot) {
+                return Box::pin(future::err(err.into()));
+            }
             if result.is_err() {
                 if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                    let bigtable_result = self
-                        .runtime
-                        .block_on(bigtable_ledger_storage.get_confirmed_block(slot));
-                    self.check_bigtable_result(&bigtable_result)?;
-                    return Ok(bigtable_result
-                        .ok()
-                        .map(|confirmed_block| confirmed_block.encode(encoding)));
+                    let bigtable_ledger_storage = bigtable_ledger_storage.clone();
+                    return Box::pin(async move {
+                        let bigtable_result =
+                            bigtable_ledger_storage.get_confirmed_block(slot).await;
+                        check_bigtable_result(&bigtable_result)?;
+                        Ok(bigtable_result
+                            .ok()
+                            .map(|confirmed_block| confirmed_block.encode(encoding)))
+                    });
                 }
             }
-            self.check_slot_cleaned_up(&result, slot)?;
-            Ok(result
-                .ok()
-                .map(|confirmed_block| confirmed_block.encode(encoding)))
+
+            Box::pin(
+                if let Err(err) = self.check_slot_cleaned_up(&result, slot) {
+                    future::err(err.into())
+                } else {
+                    future::ok(
+                        result
+                            .ok()
+                            .map(|confirmed_block| confirmed_block.encode(encoding)),
+                    )
+                },
+            )
         } else {
-            Err(RpcCustomError::BlockNotAvailable { slot }.into())
+            Box::pin(future::err(
+                RpcCustomError::BlockNotAvailable { slot }.into(),
+            ))
         }
     }
 
@@ -729,7 +722,7 @@ impl JsonRpcRequestProcessor {
         &self,
         start_slot: Slot,
         end_slot: Option<Slot>,
-    ) -> Result<Vec<Slot>> {
+    ) -> BoxFuture<Result<Vec<Slot>>> {
         let end_slot = min(
             end_slot.unwrap_or(std::u64::MAX),
             self.block_commitment_cache
@@ -738,13 +731,13 @@ impl JsonRpcRequestProcessor {
                 .highest_confirmed_root(),
         );
         if end_slot < start_slot {
-            return Ok(vec![]);
+            return Box::pin(future::ok(vec![]));
         }
         if end_slot - start_slot > MAX_GET_CONFIRMED_BLOCKS_RANGE {
-            return Err(Error::invalid_params(format!(
+            return Box::pin(future::err(Error::invalid_params(format!(
                 "Slot range too large; max {}",
                 MAX_GET_CONFIRMED_BLOCKS_RANGE
-            )));
+            ))));
         }
 
         let lowest_blockstore_slot = self.blockstore.lowest_slot();
@@ -752,43 +745,46 @@ impl JsonRpcRequestProcessor {
             // If the starting slot is lower than what's available in blockstore assume the entire
             // [start_slot..end_slot] can be fetched from BigTable.
             if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                return self
-                    .runtime
-                    .block_on(
-                        bigtable_ledger_storage
-                            .get_confirmed_blocks(start_slot, (end_slot - start_slot) as usize + 1), // increment limit by 1 to ensure returned range is inclusive of both start_slot and end_slot
-                    )
-                    .map(|mut bigtable_blocks| {
-                        bigtable_blocks.retain(|&slot| slot <= end_slot);
-                        bigtable_blocks
-                    })
-                    .map_err(|_| {
-                        Error::invalid_params(
-                            "BigTable query failed (maybe timeout due to too large range?)"
-                                .to_string(),
+                let bigtable_ledger_storage = bigtable_ledger_storage.clone();
+                return Box::pin(async move {
+                    bigtable_ledger_storage
+                        .get_confirmed_blocks(
+                            start_slot,
+                            (end_slot - start_slot) as usize + 1, // increment limit by 1 to ensure returned range is inclusive of both start_slot and end_slot
                         )
-                    });
+                        .await
+                        .map(|mut blocks| {
+                            blocks.retain(|&slot| slot <= end_slot);
+                            blocks
+                        })
+                        .map_err(|_| {
+                            Error::invalid_params(
+                                "BigTable query failed (maybe timeout due to too large range?)"
+                                    .to_string(),
+                            )
+                        })
+                });
             }
         }
 
-        Ok(self
-            .blockstore
-            .rooted_slot_iterator(max(start_slot, lowest_blockstore_slot))
-            .map_err(|_| Error::internal_error())?
-            .filter(|&slot| slot <= end_slot)
-            .collect())
+        Box::pin(future::ready(
+            self.blockstore
+                .rooted_slot_iterator(max(start_slot, lowest_blockstore_slot))
+                .map(|blocks| blocks.filter(|&slot| slot <= end_slot).collect())
+                .map_err(|_| Error::internal_error()),
+        ))
     }
 
     pub fn get_confirmed_blocks_with_limit(
         &self,
         start_slot: Slot,
         limit: usize,
-    ) -> Result<Vec<Slot>> {
+    ) -> BoxFuture<Result<Vec<Slot>>> {
         if limit > MAX_GET_CONFIRMED_BLOCKS_RANGE as usize {
-            return Err(Error::invalid_params(format!(
+            return Box::pin(future::err(Error::invalid_params(format!(
                 "Limit too large; max {}",
                 MAX_GET_CONFIRMED_BLOCKS_RANGE
-            )));
+            ))));
         }
 
         let lowest_blockstore_slot = self.blockstore.lowest_slot();
@@ -797,22 +793,25 @@ impl JsonRpcRequestProcessor {
             // If the starting slot is lower than what's available in blockstore assume the entire
             // range can be fetched from BigTable.
             if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                return Ok(self
-                    .runtime
-                    .block_on(bigtable_ledger_storage.get_confirmed_blocks(start_slot, limit))
-                    .unwrap_or_else(|_| vec![]));
+                let bigtable_ledger_storage = bigtable_ledger_storage.clone();
+                return Box::pin(async move {
+                    Ok(bigtable_ledger_storage
+                        .get_confirmed_blocks(start_slot, limit)
+                        .await
+                        .unwrap_or_else(|_| vec![]))
+                });
             }
         }
 
-        Ok(self
-            .blockstore
-            .rooted_slot_iterator(max(start_slot, lowest_blockstore_slot))
-            .map_err(|_| Error::internal_error())?
-            .take(limit)
-            .collect())
+        Box::pin(future::ready(
+            self.blockstore
+                .rooted_slot_iterator(max(start_slot, lowest_blockstore_slot))
+                .map_err(|_| Error::internal_error())
+                .map(|blocks| blocks.take(limit).collect()),
+        ))
     }
 
-    pub fn get_block_time(&self, slot: Slot) -> Result<Option<UnixTimestamp>> {
+    pub fn get_block_time(&self, slot: Slot) -> BoxFuture<Result<Option<UnixTimestamp>>> {
         if slot
             <= self
                 .block_commitment_cache
@@ -821,22 +820,34 @@ impl JsonRpcRequestProcessor {
                 .highest_confirmed_root()
         {
             let result = self.blockstore.get_block_time(slot);
-            self.check_blockstore_root(&result, slot)?;
+            if let Err(err) = self.check_blockstore_root(&result, slot) {
+                return Box::pin(future::err(err.into()));
+            }
             if result.is_err() || matches!(result, Ok(None)) {
                 if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                    let bigtable_result = self
-                        .runtime
-                        .block_on(bigtable_ledger_storage.get_confirmed_block(slot));
-                    self.check_bigtable_result(&bigtable_result)?;
-                    return Ok(bigtable_result
-                        .ok()
-                        .and_then(|confirmed_block| confirmed_block.block_time));
+                    let bigtable_ledger_storage = bigtable_ledger_storage.clone();
+                    return Box::pin(async move {
+                        let bigtable_result =
+                            bigtable_ledger_storage.get_confirmed_block(slot).await;
+                        check_bigtable_result(&bigtable_result)?;
+                        Ok(bigtable_result
+                            .ok()
+                            .and_then(|confirmed_block| confirmed_block.block_time))
+                    });
                 }
             }
-            self.check_slot_cleaned_up(&result, slot)?;
-            Ok(result.ok().unwrap_or(None))
+
+            Box::pin(
+                if let Err(err) = self.check_slot_cleaned_up(&result, slot) {
+                    future::err(err.into())
+                } else {
+                    future::ok(result.ok().unwrap_or(None))
+                },
+            )
         } else {
-            Err(RpcCustomError::BlockNotAvailable { slot }.into())
+            Box::pin(future::err(
+                RpcCustomError::BlockNotAvailable { slot }.into(),
+            ))
         }
     }
 
@@ -870,54 +881,126 @@ impl JsonRpcRequestProcessor {
         &self,
         signatures: Vec<Signature>,
         config: Option<RpcSignatureStatusConfig>,
-    ) -> Result<RpcResponse<Vec<Option<TransactionStatus>>>> {
-        let mut statuses: Vec<Option<TransactionStatus>> = vec![];
-
+    ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
         let search_transaction_history = config
             .map(|x| x.search_transaction_history)
             .unwrap_or(false);
-        let bank = self.bank(Some(CommitmentConfig::processed()));
+        let bank = self.bank(Some(CommitmentConfig::processed())).clone();
 
-        for signature in signatures {
-            let status = if let Some(status) = self.get_transaction_status(signature, &bank) {
-                Some(status)
-            } else if self.config.enable_rpc_transaction_history && search_transaction_history {
-                self.blockstore
-                    .get_transaction_status(signature)
-                    .map_err(|_| Error::internal_error())?
-                    .filter(|(slot, _status_meta)| {
-                        slot <= &self
-                            .block_commitment_cache
-                            .read()
-                            .unwrap()
-                            .highest_confirmed_root()
-                    })
-                    .map(|(slot, status_meta)| {
-                        let err = status_meta.status.clone().err();
-                        TransactionStatus {
-                            slot,
-                            status: status_meta.status,
-                            confirmations: None,
-                            err,
-                            confirmation_status: Some(TransactionConfirmationStatus::Finalized),
-                        }
-                    })
-                    .or_else(|| {
-                        if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                            self.runtime
-                                .block_on(bigtable_ledger_storage.get_signature_status(&signature))
-                                .map(Some)
-                                .unwrap_or(None)
-                        } else {
+        // Collect blockstore statuses for each signature
+        let signature_and_status = signatures.into_iter().map(|signature| {
+            (
+                signature,
+                if let Some(status) = self.get_transaction_status(signature, &bank) {
+                    Some(status)
+                } else if self.config.enable_rpc_transaction_history && search_transaction_history {
+                    match self.blockstore.get_transaction_status(signature) {
+                        Err(err) => {
+                            warn!(
+                                "get_signature_statuses: get_transaction_status for {} failed: {}",
+                                signature, err
+                            );
                             None
                         }
-                    })
+                        Ok(result) => result
+                            .filter(|(slot, _status_meta)| {
+                                slot <= &self
+                                    .block_commitment_cache
+                                    .read()
+                                    .unwrap()
+                                    .highest_confirmed_root()
+                            })
+                            .map(|(slot, status_meta)| {
+                                let err = status_meta.status.clone().err();
+                                TransactionStatus {
+                                    slot,
+                                    status: status_meta.status,
+                                    confirmations: None,
+                                    err,
+                                    confirmation_status: Some(
+                                        TransactionConfirmationStatus::Finalized,
+                                    ),
+                                }
+                            })
+                            .or(None),
+                    }
+                } else {
+                    None
+                },
+            )
+        });
+
+        /*
+                let mut statuses: Vec<Option<TransactionStatus>> = vec![];
+                for signature in &signatures {
+                    let status = if let Some(status) = self.get_transaction_status(signature, &bank) {
+                        Some(status)
+                    } else if self.config.enable_rpc_transaction_history && search_transaction_history {
+                        self.blockstore
+                            .get_transaction_status(signature)
+                            .map_err(|_| Error::internal_error())?
+
+                            Err(err) => {
+                                warn!("get_signature_statuses: get_transaction_status for {} failed: {}", signature, err);
+                                future::ready(None)
+                            },
+
+
+                            .filter(|(slot, _status_meta)| {
+                                slot <= &self
+                                    .block_commitment_cache
+                                    .read()
+                                    .unwrap()
+                                    .highest_confirmed_root()
+                            })
+                            .map(|(slot, status_meta)| {
+                                let err = status_meta.status.clone().err();
+                                TransactionStatus {
+                                    slot,
+                                    status: status_meta.status,
+                                    confirmations: None,
+                                    err,
+                                    confirmation_status: Some(TransactionConfirmationStatus::Finalized),
+                                }
+                            })
+                            .or(None)
+                    } else {
+                        None
+                    };
+                    statuses.push(status);
+                }
+        */
+
+        let bigtable_ledger_storage =
+            if self.config.enable_rpc_transaction_history && search_transaction_history {
+                self.bigtable_ledger_storage.clone()
             } else {
                 None
             };
-            statuses.push(status);
-        }
-        Ok(new_response(&bank, statuses))
+
+        // For each signature without a blockstore status, check BigTable for a status
+        let statuses =
+            future::join_all(signature_and_status.into_iter().map(|(signature, status)| {
+                let bigtable_ledger_storage = bigtable_ledger_storage.clone();
+                async move {
+                    if status.is_some() {
+                        return status;
+                    }
+
+                    if let Some(bigtable_ledger_storage) = &bigtable_ledger_storage {
+                        return bigtable_ledger_storage
+                            .get_signature_status(&signature)
+                            .await
+                            .map(Some)
+                            .unwrap_or(None);
+                    }
+                    None
+                }
+            }));
+        //} else {
+        //    future::ready(signature_and_status.into_iter().map(|(_signature, status)| status).collect())
+
+        Box::pin(async move { Ok(new_response(&bank, statuses.await)) })
     }
 
     fn get_transaction_status(
@@ -961,7 +1044,7 @@ impl JsonRpcRequestProcessor {
         &self,
         signature: Signature,
         encoding: Option<UiTransactionEncoding>,
-    ) -> Option<EncodedConfirmedTransaction> {
+    ) -> BoxFuture<Result<Option<EncodedConfirmedTransaction>>> {
         let encoding = encoding.unwrap_or(UiTransactionEncoding::Json);
         if self.config.enable_rpc_transaction_history {
             match self
@@ -977,21 +1060,24 @@ impl JsonRpcRequestProcessor {
                             .unwrap()
                             .highest_confirmed_root()
                     {
-                        return Some(confirmed_transaction.encode(encoding));
+                        return Box::pin(future::ok(Some(confirmed_transaction.encode(encoding))));
                     }
                 }
                 None => {
                     if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                        return self
-                            .runtime
-                            .block_on(bigtable_ledger_storage.get_confirmed_transaction(&signature))
-                            .unwrap_or(None)
-                            .map(|confirmed| confirmed.encode(encoding));
+                        let bigtable_ledger_storage = bigtable_ledger_storage.clone();
+                        return Box::pin(async move {
+                            Ok(bigtable_ledger_storage
+                                .get_confirmed_transaction(&signature)
+                                .await
+                                .unwrap_or(None)
+                                .map(|confirmed| confirmed.encode(encoding)))
+                        });
                     }
                 }
             }
         }
-        None
+        Box::pin(future::ok(None))
     }
 
     pub fn get_confirmed_signatures_for_address(
@@ -1024,75 +1110,83 @@ impl JsonRpcRequestProcessor {
         mut before: Option<Signature>,
         until: Option<Signature>,
         mut limit: usize,
-    ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        if self.config.enable_rpc_transaction_history {
-            let highest_confirmed_root = self
-                .block_commitment_cache
-                .read()
-                .unwrap()
-                .highest_confirmed_root();
+    ) -> BoxFuture<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>> {
+        if !self.config.enable_rpc_transaction_history {
+            return Box::pin(future::ok(vec![]));
+        }
 
-            let mut results = self
-                .blockstore
-                .get_confirmed_signatures_for_address2(
-                    address,
-                    highest_confirmed_root,
-                    before,
-                    until,
-                    limit,
-                )
-                .map_err(|err| Error::invalid_params(format!("{}", err)))?;
+        let highest_confirmed_root = self
+            .block_commitment_cache
+            .read()
+            .unwrap()
+            .highest_confirmed_root();
 
-            if results.len() < limit {
-                if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                    if !results.is_empty() {
-                        limit -= results.len();
-                        before = results.last().map(|x| x.signature);
+        match self.blockstore.get_confirmed_signatures_for_address2(
+            address,
+            highest_confirmed_root,
+            before,
+            until,
+            limit,
+        ) {
+            Err(err) => Box::pin(future::err(Error::invalid_params(format!("{}", err)))),
+            Ok(mut results) => {
+                let bigtable_ledger_storage = self.bigtable_ledger_storage.clone();
+
+                Box::pin(async move {
+                    if results.len() < limit {
+                        if let Some(bigtable_ledger_storage) = &bigtable_ledger_storage {
+                            if !results.is_empty() {
+                                limit -= results.len();
+                                before = results.last().map(|x| x.signature);
+                            }
+
+                            let bigtable_results = bigtable_ledger_storage
+                                .get_confirmed_signatures_for_address(
+                                    &address,
+                                    before.as_ref(),
+                                    until.as_ref(),
+                                    limit,
+                                )
+                                .await;
+                            match bigtable_results {
+                                Ok(bigtable_results) => {
+                                    results.extend(bigtable_results.into_iter().map(|x| x.0));
+                                }
+                                Err(err) => {
+                                    warn!("{:?}", err);
+                                }
+                            }
+                        }
                     }
 
-                    let bigtable_results = self.runtime.block_on(
-                        bigtable_ledger_storage.get_confirmed_signatures_for_address(
-                            &address,
-                            before.as_ref(),
-                            until.as_ref(),
-                            limit,
-                        ),
-                    );
-                    match bigtable_results {
-                        Ok(bigtable_results) => {
-                            results.extend(bigtable_results.into_iter().map(|x| x.0));
-                        }
-                        Err(err) => {
-                            warn!("{:?}", err);
-                        }
-                    }
-                }
+                    Ok(results.into_iter().map(|x| x.into()).collect())
+                })
             }
-
-            Ok(results.into_iter().map(|x| x.into()).collect())
-        } else {
-            Ok(vec![])
         }
     }
 
-    pub fn get_first_available_block(&self) -> Slot {
+    pub fn get_first_available_block(&self) -> BoxFuture<Result<Slot>> {
         let slot = self
             .blockstore
             .get_first_available_block()
             .unwrap_or_default();
 
         if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-            let bigtable_slot = self
-                .runtime
-                .block_on(bigtable_ledger_storage.get_first_available_block())
-                .unwrap_or(None)
-                .unwrap_or(slot);
+            let bigtable_ledger_storage = bigtable_ledger_storage.clone();
+            return Box::pin(async move {
+                error!("TODO get_first_available_block pre");
+                let bigtable_slot = bigtable_ledger_storage
+                    .get_first_available_block()
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or(slot);
 
-            if bigtable_slot < slot {
-                return bigtable_slot;
-            }
+                error!("TODO get_first_available_block post");
+                Ok(std::cmp::min(bigtable_slot, slot))
+            });
+        } else {
+            Box::pin(future::ok(slot))
         }
-        slot
     }
 
     pub fn get_stake_activation(
@@ -1457,6 +1551,21 @@ impl JsonRpcRequestProcessor {
             self.get_filtered_program_accounts(bank, &spl_token_id_v2_0(), filters)
         }
     }
+}
+
+fn check_bigtable_result<T>(
+    result: &std::result::Result<T, solana_storage_bigtable::Error>,
+) -> Result<()>
+where
+    T: std::fmt::Debug,
+{
+    if result.is_err() {
+        let err = result.as_ref().unwrap_err();
+        if let solana_storage_bigtable::Error::BlockNotFound(slot) = err {
+            return Err(RpcCustomError::LongTermStorageSlotSkipped { slot: *slot }.into());
+        }
+    }
+    Ok(())
 }
 
 fn verify_transaction(transaction: &Transaction) -> Result<()> {
@@ -1848,7 +1957,7 @@ pub trait RpcSol {
         meta: Self::Metadata,
         signature_strs: Vec<String>,
         config: Option<RpcSignatureStatusConfig>,
-    ) -> Result<RpcResponse<Vec<Option<TransactionStatus>>>>;
+    ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>>;
 
     #[rpc(meta, name = "getSlot")]
     fn get_slot(&self, meta: Self::Metadata, commitment: Option<CommitmentConfig>) -> Result<Slot>;
@@ -1942,10 +2051,14 @@ pub trait RpcSol {
         meta: Self::Metadata,
         slot: Slot,
         encoding: Option<UiTransactionEncoding>,
-    ) -> Result<Option<EncodedConfirmedBlock>>;
+    ) -> BoxFuture<Result<Option<EncodedConfirmedBlock>>>;
 
     #[rpc(meta, name = "getBlockTime")]
-    fn get_block_time(&self, meta: Self::Metadata, slot: Slot) -> Result<Option<UnixTimestamp>>;
+    fn get_block_time(
+        &self,
+        meta: Self::Metadata,
+        slot: Slot,
+    ) -> BoxFuture<Result<Option<UnixTimestamp>>>;
 
     #[rpc(meta, name = "getConfirmedBlocks")]
     fn get_confirmed_blocks(
@@ -1953,7 +2066,7 @@ pub trait RpcSol {
         meta: Self::Metadata,
         start_slot: Slot,
         end_slot: Option<Slot>,
-    ) -> Result<Vec<Slot>>;
+    ) -> BoxFuture<Result<Vec<Slot>>>;
 
     #[rpc(meta, name = "getConfirmedBlocksWithLimit")]
     fn get_confirmed_blocks_with_limit(
@@ -1961,7 +2074,7 @@ pub trait RpcSol {
         meta: Self::Metadata,
         start_slot: Slot,
         limit: usize,
-    ) -> Result<Vec<Slot>>;
+    ) -> BoxFuture<Result<Vec<Slot>>>;
 
     #[rpc(meta, name = "getConfirmedTransaction")]
     fn get_confirmed_transaction(
@@ -1969,7 +2082,7 @@ pub trait RpcSol {
         meta: Self::Metadata,
         signature_str: String,
         encoding: Option<UiTransactionEncoding>,
-    ) -> Result<Option<EncodedConfirmedTransaction>>;
+    ) -> BoxFuture<Result<Option<EncodedConfirmedTransaction>>>;
 
     #[rpc(meta, name = "getConfirmedSignaturesForAddress")]
     fn get_confirmed_signatures_for_address(
@@ -1986,10 +2099,10 @@ pub trait RpcSol {
         meta: Self::Metadata,
         address: String,
         config: Option<RpcGetConfirmedSignaturesForAddress2Config>,
-    ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>>;
+    ) -> BoxFuture<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>>;
 
     #[rpc(meta, name = "getFirstAvailableBlock")]
-    fn get_first_available_block(&self, meta: Self::Metadata) -> Result<Slot>;
+    fn get_first_available_block(&self, meta: Self::Metadata) -> BoxFuture<Result<Slot>>;
 
     #[rpc(meta, name = "getStakeActivation")]
     fn get_stake_activation(
@@ -2414,20 +2527,23 @@ impl RpcSol for RpcSolImpl {
         meta: Self::Metadata,
         signature_strs: Vec<String>,
         config: Option<RpcSignatureStatusConfig>,
-    ) -> Result<RpcResponse<Vec<Option<TransactionStatus>>>> {
+    ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
         debug!(
             "get_signature_statuses rpc request received: {:?}",
             signature_strs.len()
         );
         if signature_strs.len() > MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS {
-            return Err(Error::invalid_params(format!(
+            return Box::pin(future::err(Error::invalid_params(format!(
                 "Too many inputs provided; max {}",
                 MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS
-            )));
+            ))));
         }
         let mut signatures: Vec<Signature> = vec![];
         for signature_str in signature_strs {
-            signatures.push(verify_signature(&signature_str)?);
+            signatures.push(match verify_signature(&signature_str) {
+                Ok(signature) => signature,
+                Err(err) => return Box::pin(future::err(err.into())),
+            });
         }
         meta.get_signature_statuses(signatures, config)
     }
@@ -2668,7 +2784,7 @@ impl RpcSol for RpcSolImpl {
         meta: Self::Metadata,
         slot: Slot,
         encoding: Option<UiTransactionEncoding>,
-    ) -> Result<Option<EncodedConfirmedBlock>> {
+    ) -> BoxFuture<Result<Option<EncodedConfirmedBlock>>> {
         debug!("get_confirmed_block rpc request received: {:?}", slot);
         meta.get_confirmed_block(slot, encoding)
     }
@@ -2678,7 +2794,7 @@ impl RpcSol for RpcSolImpl {
         meta: Self::Metadata,
         start_slot: Slot,
         end_slot: Option<Slot>,
-    ) -> Result<Vec<Slot>> {
+    ) -> BoxFuture<Result<Vec<Slot>>> {
         debug!(
             "get_confirmed_blocks rpc request received: {}-{:?}",
             start_slot, end_slot
@@ -2691,7 +2807,7 @@ impl RpcSol for RpcSolImpl {
         meta: Self::Metadata,
         start_slot: Slot,
         limit: usize,
-    ) -> Result<Vec<Slot>> {
+    ) -> BoxFuture<Result<Vec<Slot>>> {
         debug!(
             "get_confirmed_blocks_with_limit rpc request received: {}-{}",
             start_slot, limit,
@@ -2699,7 +2815,11 @@ impl RpcSol for RpcSolImpl {
         meta.get_confirmed_blocks_with_limit(start_slot, limit)
     }
 
-    fn get_block_time(&self, meta: Self::Metadata, slot: Slot) -> Result<Option<UnixTimestamp>> {
+    fn get_block_time(
+        &self,
+        meta: Self::Metadata,
+        slot: Slot,
+    ) -> BoxFuture<Result<Option<UnixTimestamp>>> {
         meta.get_block_time(slot)
     }
 
@@ -2708,13 +2828,15 @@ impl RpcSol for RpcSolImpl {
         meta: Self::Metadata,
         signature_str: String,
         encoding: Option<UiTransactionEncoding>,
-    ) -> Result<Option<EncodedConfirmedTransaction>> {
+    ) -> BoxFuture<Result<Option<EncodedConfirmedTransaction>>> {
         debug!(
             "get_confirmed_transaction rpc request received: {:?}",
             signature_str
         );
-        let signature = verify_signature(&signature_str)?;
-        Ok(meta.get_confirmed_transaction(signature, encoding))
+        match verify_signature(&signature_str) {
+            Ok(signature) => meta.get_confirmed_transaction(signature, encoding),
+            Err(err) => Box::pin(future::err(err.into())),
+        }
     }
 
     fn get_confirmed_signatures_for_address(
@@ -2753,17 +2875,26 @@ impl RpcSol for RpcSolImpl {
         meta: Self::Metadata,
         address: String,
         config: Option<RpcGetConfirmedSignaturesForAddress2Config>,
-    ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        let address = verify_pubkey(address)?;
+    ) -> BoxFuture<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>> {
+        let address = match verify_pubkey(address) {
+            Ok(address) => address,
+            Err(err) => return Box::pin(future::err(err.into())),
+        };
 
         let config = config.unwrap_or_default();
         let before = if let Some(before) = config.before {
-            Some(verify_signature(&before)?)
+            Some(match verify_signature(&before) {
+                Ok(signature) => signature,
+                Err(err) => return Box::pin(future::err(err.into())),
+            })
         } else {
             None
         };
         let until = if let Some(until) = config.until {
-            Some(verify_signature(&until)?)
+            Some(match verify_signature(&until) {
+                Ok(signature) => signature,
+                Err(err) => return Box::pin(future::err(err.into())),
+            })
         } else {
             None
         };
@@ -2772,18 +2903,18 @@ impl RpcSol for RpcSolImpl {
             .unwrap_or(MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT);
 
         if limit == 0 || limit > MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT {
-            return Err(Error::invalid_params(format!(
+            return Box::pin(future::err(Error::invalid_params(format!(
                 "Invalid limit; max {}",
                 MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT
-            )));
+            ))));
         }
 
         meta.get_confirmed_signatures_for_address2(address, before, until, limit)
     }
 
-    fn get_first_available_block(&self, meta: Self::Metadata) -> Result<Slot> {
+    fn get_first_available_block(&self, meta: Self::Metadata) -> BoxFuture<Result<Slot>> {
         debug!("get_first_available_block rpc request received");
-        Ok(meta.get_first_available_block())
+        meta.get_first_available_block()
     }
 
     fn get_stake_activation(
@@ -3152,7 +3283,6 @@ pub mod tests {
             RpcHealth::stub(),
             cluster_info.clone(),
             Hash::default(),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
@@ -4561,7 +4691,6 @@ pub mod tests {
             health.clone(),
             cluster_info,
             Hash::default(),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
@@ -4757,7 +4886,6 @@ pub mod tests {
             RpcHealth::stub(),
             cluster_info,
             Hash::default(),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
@@ -4790,7 +4918,6 @@ pub mod tests {
             RpcHealth::stub(),
             cluster_info,
             Hash::default(),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
@@ -4882,7 +5009,6 @@ pub mod tests {
             RpcHealth::stub(),
             cluster_info,
             Hash::default(),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
             None,
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
         );
@@ -6111,7 +6237,6 @@ pub mod tests {
             RpcHealth::stub(),
             cluster_info,
             Hash::default(),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
             None,
             optimistically_confirmed_bank.clone(),
         );
