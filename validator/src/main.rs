@@ -915,6 +915,12 @@ pub fn main() {
                 .help("Use this port for JSON RPC and the next port for the RPC websocket"),
         )
         .arg(
+            Arg::with_name("minimal_rpc_api")
+                .long("--minimal-rpc-api")
+                .takes_value(false)
+                .hidden(true)  // Stub implementation for v1.6 forwards compatibility
+        )
+        .arg(
             Arg::with_name("private_rpc")
                 .long("--private-rpc")
                 .takes_value(false)
