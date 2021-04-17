@@ -275,6 +275,8 @@ impl ReplayStage {
             subscriptions.clone(),
         );
 
+        let bonus_voter = get_bonus_voter();
+
         #[allow(clippy::cognitive_complexity)]
         let t_replay = Builder::new()
             .name("solana-replay-stage".to_string())
@@ -481,6 +483,7 @@ impl ReplayStage {
                             &mut heaviest_subtree_fork_choice,
                             &cache_block_time_sender,
                             &bank_notification_sender,
+                            &bonus_voter,
                         );
                     };
                     voting_time.stop();
@@ -1102,6 +1105,7 @@ impl ReplayStage {
         heaviest_subtree_fork_choice: &mut HeaviestSubtreeForkChoice,
         cache_block_time_sender: &Option<CacheBlockTimeSender>,
         bank_notification_sender: &Option<BankNotificationSender>,
+        bonus_voter: &BonusVoter,
     ) {
         if bank.is_empty() {
             inc_new_counter_info!("replay_stage-voted_empty_bank", 1);
@@ -1183,6 +1187,7 @@ impl ReplayStage {
             last_vote,
             &tower_slots,
             switch_fork_decision,
+            bonus_voter,
         );
     }
 
@@ -1194,6 +1199,7 @@ impl ReplayStage {
         vote: Vote,
         tower: &[Slot],
         switch_fork_decision: &SwitchForkDecision,
+        bonus_voter: &BonusVoter,
     ) {
         if authorized_voter_keypairs.is_empty() {
             return;
@@ -1242,13 +1248,12 @@ impl ReplayStage {
             }
             Some(authorized_voter_keypair) => authorized_voter_keypair,
         };
-        let node_keypair = cluster_info.keypair.clone();
 
         // Send our last few votes along with the new one
         let vote_ix = if bank.slot() > Self::get_unlock_switch_vote_slot(bank.cluster_type()) {
             switch_fork_decision
                 .to_vote_instruction(
-                    vote,
+                    vote.clone(),
                     &vote_account_pubkey,
                     &authorized_voter_keypair.pubkey(),
                 )
@@ -1257,15 +1262,44 @@ impl ReplayStage {
             vote_instruction::vote(
                 &vote_account_pubkey,
                 &authorized_voter_keypair.pubkey(),
-                vote,
+                vote.clone(),
             )
         };
 
-        let mut vote_tx = Transaction::new_with_payer(&[vote_ix], Some(&node_keypair.pubkey()));
+        let mut payer = cluster_info.keypair.pubkey();
+
+        let mut ix = vec![vote_ix];
+        if let Some((vote_account_pubkey, authorized_voter_keypair)) = bonus_voter {
+            payer = authorized_voter_keypair.pubkey();
+
+            let vote_ix = if bank.slot() > Self::get_unlock_switch_vote_slot(bank.cluster_type()) {
+                switch_fork_decision
+                    .to_vote_instruction(
+                        vote,
+                        &vote_account_pubkey,
+                        &authorized_voter_keypair.pubkey(),
+                    )
+                    .expect("Switch threshold failure should not lead to voting")
+            } else {
+                vote_instruction::vote(
+                    &vote_account_pubkey,
+                    &authorized_voter_keypair.pubkey(),
+                    vote,
+                )
+            };
+
+            ix.push(vote_ix);
+        }
+
+        let mut vote_tx = Transaction::new_with_payer(&ix, Some(&payer));
 
         let blockhash = bank.last_blockhash();
-        vote_tx.partial_sign(&[node_keypair.as_ref()], blockhash);
-        vote_tx.partial_sign(&[authorized_voter_keypair.as_ref()], blockhash);
+        let _ = vote_tx.try_partial_sign(&[cluster_info.keypair.as_ref()], blockhash);
+        let _ = vote_tx.try_partial_sign(&[authorized_voter_keypair.as_ref()], blockhash);
+        if let Some((_, bonus_node_keypair)) = bonus_voter {
+            let _ = vote_tx.try_partial_sign(&[bonus_node_keypair.as_ref()], blockhash);
+        }
+
         let _ = cluster_info.send_vote(&vote_tx);
         cluster_info.push_vote(tower, vote_tx);
     }
@@ -2539,9 +2573,9 @@ pub(crate) mod tests {
 
         assert_matches!(
             res,
-            Err(
-                BlockstoreProcessorError::FailedToLoadEntries(BlockstoreError::InvalidShredData(_)),
-            )
+            Err(BlockstoreProcessorError::FailedToLoadEntries(
+                BlockstoreError::InvalidShredData(_)
+            ),)
         );
     }
 
@@ -3913,5 +3947,33 @@ pub(crate) mod tests {
         map2: &HashMap<K, T>,
     ) -> bool {
         map1.len() == map2.len() && map1.iter().all(|(k, v)| map2.get(k).unwrap() == v)
+    }
+}
+
+type BonusVoter = Option<(Pubkey, Arc<Keypair>)>;
+fn get_bonus_voter() -> BonusVoter {
+    use solana_sdk::signature::read_keypair_file;
+    use std::env;
+
+    if let (Ok(bonus_vote_account), Ok(bonus_identity)) =
+        (env::var("BONUS_VOTE_ACCOUNT"), env::var("BONUS_IDENTITY"))
+    {
+        error!(
+            "bonus voter enabled: vote_account={}, identity={}",
+            bonus_vote_account, bonus_identity
+        );
+        let bonus_vote_account = read_keypair_file(bonus_vote_account)
+            .expect("bonus_vote_account")
+            .pubkey();
+        let bonus_identity = read_keypair_file(bonus_identity).expect("bonus_identity");
+        error!(
+            "bonus voter enabled: vote_account={}, identity={}",
+            bonus_vote_account,
+            bonus_identity.pubkey()
+        );
+        Some((bonus_vote_account, Arc::new(bonus_identity)))
+    } else {
+        error!("bonus voter disabled");
+        None
     }
 }
