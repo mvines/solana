@@ -629,6 +629,9 @@ impl ClusterInfoVoteListener {
                     }
                 }
                 if reached_threshold_results[1] {
+                    error!("LAST_VOTE_SLOT store: {}", last_vote_slot);
+                    solana_metrics::LAST_VOTE_SLOT.store(last_vote_slot, Ordering::Relaxed);
+
                     new_optimistic_confirmed_slots.push((last_vote_slot, last_vote_hash));
                     // Notify subscribers about new optimistic confirmation
                     if let Some(sender) = bank_notification_sender {

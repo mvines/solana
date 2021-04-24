@@ -485,8 +485,20 @@ impl ReplayStage {
                     compute_slot_stats_time.stop();
 
                     let mut select_forks_time = Measure::start("select_forks_time");
-                    let (heaviest_bank, heaviest_bank_on_same_voted_fork) = heaviest_subtree_fork_choice
-                        .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
+
+                    let (heaviest_bank, heaviest_bank_on_same_voted_fork) = if std::env::var("LAST_VOTE_SLOT").is_ok() {
+                        let last_vote_slot = solana_metrics::LAST_VOTE_SLOT.load(Ordering::Relaxed);
+                        error!("LAST_VOTE_SLOT load: {}", last_vote_slot);
+                        let bank_forks = bank_forks.read().unwrap();
+                        let bank = bank_forks.get(
+                            last_vote_slot).map(|b| b.clone())
+                            .unwrap_or_else(|| bank_forks.root_bank().clone());
+                        (bank.clone(), Some(bank))
+                    } else {
+                        heaviest_subtree_fork_choice
+                        .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks)
+                    };
+
                     select_forks_time.stop();
 
                     Self::report_memory(&allocated, "select_fork", start);
