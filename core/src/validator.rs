@@ -260,6 +260,8 @@ pub struct Validator {
     tpu: Tpu,
     tvu: Tvu,
     ip_echo_server: Option<solana_net_utils::IpEchoServer>,
+    node: Node,
+    bank_forks: Arc<RwLock<BankForks>>,
 }
 
 // in the distant future, get rid of ::new()/exit() and use Result properly...
@@ -574,12 +576,13 @@ impl Validator {
             std::thread::park();
         }
 
-        let ip_echo_server = node.sockets.ip_echo.map(solana_net_utils::ip_echo_server);
+        //let ip_echo_server = node.sockets.ip_echo.map(solana_net_utils::ip_echo_server);
+        let ip_echo_server = node.sockets.ip_echo.as_ref().map(|tcp_listener| solana_net_utils::ip_echo_server(tcp_listener.try_clone().unwrap()));
 
         let gossip_service = GossipService::new(
             &cluster_info,
             Some(bank_forks.clone()),
-            node.sockets.gossip,
+            node.sockets.gossip.try_clone().expect("try_clone"),
             config.gossip_validators.clone(),
             should_check_duplicate_instance,
             &exit,
@@ -588,7 +591,7 @@ impl Validator {
         let serve_repair_service = ServeRepairService::new(
             &serve_repair,
             Some(blockstore.clone()),
-            node.sockets.serve_repair,
+            node.sockets.serve_repair.try_clone().expect("try_clone"),
             &exit,
         );
 
@@ -746,9 +749,9 @@ impl Validator {
             &poh_recorder,
             entry_receiver,
             retransmit_slots_receiver,
-            node.sockets.tpu,
-            node.sockets.tpu_forwards,
-            node.sockets.broadcast,
+            node.sockets.tpu.iter().map(|u| u.try_clone().expect("try_clone")).collect(),
+            node.sockets.tpu_forwards.iter().map(|u| u.try_clone().expect("try_clone")).collect(),
+            node.sockets.broadcast.iter().map(|u| u.try_clone().expect("try_clone")).collect(),
             &rpc_subscriptions,
             transaction_status_sender,
             &blockstore,
@@ -756,7 +759,7 @@ impl Validator {
             &exit,
             node.info.shred_version,
             vote_tracker,
-            bank_forks,
+            bank_forks.clone(),
             verified_vote_sender,
             gossip_verified_vote_hash_sender,
             replay_vote_receiver,
@@ -770,6 +773,8 @@ impl Validator {
         datapoint_info!("validator-new", ("id", id.to_string(), String));
         *start_progress.write().unwrap() = ValidatorStartProgress::Running;
         Self {
+            node,
+            bank_forks,
             blockstore,
             gossip_service,
             serve_repair_service,
@@ -891,7 +896,7 @@ impl Validator {
         }
         let mut blockstore = match Arc::try_unwrap(self.blockstore) {
             Ok(blockstore) => blockstore,
-            Err(_) => panic!("try_unwrap() should always succeed"),
+            Err(_) => panic!("blockstore try_unwrap() should always succeed"),
         };
         blockstore.clear_signals();
 
@@ -907,6 +912,13 @@ impl Validator {
             ip_echo_server.shutdown_background();
         }
 
+        let bank_forks = match Arc::try_unwrap(self.bank_forks) {
+            Ok(bank_forks) => bank_forks,
+            Err(_) => panic!("bank forks try_unwrap() should always succeed"),
+        };
+        let bank_forks = bank_forks.into_inner().unwrap();
+        error!("ROOT is {}", bank_forks.root());
+        error!("NODE is {}", self.node.info.id);
     }
 }
 
