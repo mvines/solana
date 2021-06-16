@@ -241,6 +241,7 @@ struct TransactionHistoryServices {
 }
 
 pub struct Validator {
+    blockstore: Arc<Blockstore>,
     validator_exit: Arc<RwLock<Exit>>,
     json_rpc_service: Option<JsonRpcService>,
     pubsub_service: Option<PubSubService>,
@@ -769,6 +770,7 @@ impl Validator {
         datapoint_info!("validator-new", ("id", id.to_string(), String));
         *start_progress.write().unwrap() = ValidatorStartProgress::Running;
         Self {
+            blockstore,
             gossip_service,
             serve_repair_service,
             json_rpc_service,
@@ -837,10 +839,6 @@ impl Validator {
             pubsub_service.join().expect("pubsub_service");
         }
 
-        self.rpc_completed_slots_service
-            .join()
-            .expect("rpc_completed_slots_service");
-
         if let Some(optimistically_confirmed_bank_tracker) =
             self.optimistically_confirmed_bank_tracker
         {
@@ -882,6 +880,25 @@ impl Validator {
             .join()
             .expect("serve_repair_service");
         self.tpu.join().expect("tpu");
+
+        loop {
+            let strong_count = Arc::strong_count(&self.blockstore);
+            if strong_count == 1 {
+                break;
+            }
+            info!("Waiting for {} thread(s) to drop their blockstore reference", strong_count.saturating_sub(1));
+            sleep(Duration::from_millis(100));
+        }
+        let mut blockstore = match Arc::try_unwrap(self.blockstore) {
+            Ok(blockstore) => blockstore,
+            Err(_) => panic!("try_unwrap() should always succeed"),
+        };
+        blockstore.clear_signals();
+
+        self.rpc_completed_slots_service
+            .join()
+            .expect("rpc_completed_slots_service");
+
         self.tvu.join().expect("tvu");
         self.completed_data_sets_service
             .join()
@@ -889,6 +906,7 @@ impl Validator {
         if let Some(ip_echo_server) = self.ip_echo_server {
             ip_echo_server.shutdown_background();
         }
+
     }
 }
 
@@ -1075,6 +1093,9 @@ fn new_banks_from_ledger(
         enforce_ulimit_nofile,
     )
     .expect("Failed to open ledger database");
+
+    // OR blockstore.reset() ^^^
+
     blockstore.set_no_compaction(config.no_rocksdb_compaction);
 
     let tower_path = config.tower_path.as_deref().unwrap_or(ledger_path);

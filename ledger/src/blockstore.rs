@@ -145,7 +145,7 @@ pub struct Blockstore {
     last_root: Arc<RwLock<Slot>>,
     insert_shreds_lock: Arc<Mutex<()>>,
     pub new_shreds_signals: Vec<SyncSender<bool>>,
-    pub completed_slots_senders: Vec<CompletedSlotsSender>,
+    completed_slots_senders: Vec<CompletedSlotsSender>,
     pub lowest_cleanup_slot: Arc<RwLock<Slot>>,
     no_compaction: bool,
 }
@@ -379,24 +379,34 @@ impl Blockstore {
         recovery_mode: Option<BlockstoreRecoveryMode>,
         enforce_ulimit_nofile: bool,
     ) -> Result<BlockstoreSignals> {
-        let mut blockstore = Self::open_with_access_type(
+        let blockstore = Self::open_with_access_type(
             ledger_path,
             AccessType::PrimaryOnly,
             recovery_mode,
             enforce_ulimit_nofile,
         )?;
+
+        Ok(blockstore.reset_signals())
+    }
+
+    pub fn reset_signals(mut self) -> BlockstoreSignals {
         let (ledger_signal_sender, ledger_signal_receiver) = sync_channel(1);
         let (completed_slots_sender, completed_slots_receiver) =
             sync_channel(MAX_COMPLETED_SLOTS_IN_CHANNEL);
 
-        blockstore.new_shreds_signals = vec![ledger_signal_sender];
-        blockstore.completed_slots_senders = vec![completed_slots_sender];
+        self.new_shreds_signals = vec![ledger_signal_sender];
+        self.completed_slots_senders = vec![completed_slots_sender];
 
-        Ok(BlockstoreSignals {
-            blockstore,
+        BlockstoreSignals {
+            blockstore: self,
             ledger_signal_receiver,
             completed_slots_receiver,
-        })
+        }
+    }
+
+    pub fn clear_signals(&mut self) {
+        self.new_shreds_signals = vec![];
+        self.completed_slots_senders = vec![];
     }
 
     pub fn add_tree(
