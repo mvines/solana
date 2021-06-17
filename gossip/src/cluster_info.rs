@@ -224,7 +224,7 @@ pub struct ClusterInfo {
     local_message_pending_push_queue: Mutex<Vec<CrdsValue>>,
     contact_debug_interval: u64, // milliseconds, 0 = disabled
     contact_save_interval: u64,  // milliseconds, 0 = disabled
-    instance: NodeInstance,
+    instance: RwLock<NodeInstance>,
     contact_info_path: PathBuf,
 }
 
@@ -481,7 +481,7 @@ impl ClusterInfo {
             socket: UdpSocket::bind("0.0.0.0:0").unwrap(),
             local_message_pending_push_queue: Mutex::default(),
             contact_debug_interval: DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS,
-            instance: NodeInstance::new(&mut thread_rng(), id, timestamp()),
+            instance: RwLock::new(NodeInstance::new(&mut thread_rng(), id, timestamp())),
             contact_info_path: PathBuf::default(),
             contact_save_interval: 0, // disabled
         };
@@ -517,7 +517,7 @@ impl ClusterInfo {
                     .clone(),
             ),
             contact_debug_interval: self.contact_debug_interval,
-            instance: NodeInstance::new(&mut thread_rng(), *new_id, timestamp()),
+            instance: RwLock::new(NodeInstance::new(&mut thread_rng(), *new_id, timestamp())),
             contact_info_path: PathBuf::default(),
             contact_save_interval: 0, // disabled
         }
@@ -536,7 +536,7 @@ impl ClusterInfo {
         self.my_contact_info.write().unwrap().wallclock = now;
         let entries: Vec<_> = vec![
             CrdsData::ContactInfo(self.my_contact_info()),
-            CrdsData::NodeInstance(self.instance.with_wallclock(now)),
+            CrdsData::NodeInstance(self.instance.read().unwrap().with_wallclock(now)),
         ]
         .into_iter()
         .map(|v| CrdsValue::new_signed(v, &self.keypair))
@@ -677,7 +677,15 @@ impl ClusterInfo {
     }
 
     pub fn id(&self) -> Pubkey {
-        self.my_contact_info().id
+        self.my_contact_info.read().unwrap().id
+    }
+
+    pub fn set_id(&self, id: Pubkey) {
+        self.my_contact_info.write().unwrap().id = id;
+        {
+            let mut instance = self.instance.write().unwrap();
+            *instance = instance.with_id(id);
+        }
     }
 
     pub fn lookup_contact_info<F, Y>(&self, id: &Pubkey, map: F) -> Option<Y>
@@ -1799,7 +1807,9 @@ impl ClusterInfo {
                 let recycler = PacketsRecycler::default();
                 let crds_data = vec![
                     CrdsData::Version(Version::new(self.id())),
-                    CrdsData::NodeInstance(self.instance.with_wallclock(timestamp())),
+                    CrdsData::NodeInstance(
+                        self.instance.read().unwrap().with_wallclock(timestamp()),
+                    ),
                 ];
                 for value in crds_data {
                     let value = CrdsValue::new_signed(value, &self.keypair);
@@ -2521,8 +2531,9 @@ impl ClusterInfo {
         // this node with more recent timestamp.
         let check_duplicate_instance = |values: &[CrdsValue]| {
             if should_check_duplicate_instance {
+                let instance = self.instance.read().unwrap();
                 for value in values {
-                    if self.instance.check_duplicate(value) {
+                    if instance.check_duplicate(value) {
                         return Err(GossipError::DuplicateNodeInstance);
                     }
                 }
