@@ -22,7 +22,6 @@ use solana_perf::packet::{limited_deserialize, Packets, PacketsRecycler};
 use solana_sdk::{
     clock::Slot,
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
     timing::duration_as_ms,
 };
 use solana_streamer::streamer::{PacketReceiver, PacketSender};
@@ -101,8 +100,6 @@ pub enum RepairProtocol {
 
 #[derive(Clone)]
 pub struct ServeRepair {
-    /// set the keypair that will be used to sign repair responses
-    keypair: Arc<Keypair>,
     my_info: ContactInfo,
     cluster_info: Arc<ClusterInfo>,
 }
@@ -118,20 +115,14 @@ impl ServeRepair {
     }
 
     pub fn new(cluster_info: Arc<ClusterInfo>) -> Self {
-        let (keypair, my_info) = { (cluster_info.keypair.clone(), cluster_info.my_contact_info()) };
         Self {
-            keypair,
-            my_info,
+            my_info: cluster_info.my_contact_info(),
             cluster_info,
         }
     }
 
     pub fn my_info(&self) -> &ContactInfo {
         &self.my_info
-    }
-
-    pub fn keypair(&self) -> &Arc<Keypair> {
-        &self.keypair
     }
 
     fn get_repair_sender(request: &RepairProtocol) -> &ContactInfo {
@@ -156,7 +147,7 @@ impl ServeRepair {
         let now = Instant::now();
 
         //TODO verify from is signed
-        let my_id = me.read().unwrap().keypair.pubkey();
+        let my_id = me.read().unwrap().my_info.id;
         let from = Self::get_repair_sender(&request);
         if from.id == my_id {
             stats.self_repair += 1;
@@ -271,7 +262,7 @@ impl ServeRepair {
 
     fn report_reset_stats(me: &Arc<RwLock<Self>>, stats: &mut ServeRepairStats) {
         if stats.self_repair > 0 {
-            let my_id = me.read().unwrap().keypair.pubkey();
+            let my_id = me.read().unwrap().my_info.id;
             warn!(
                 "{}: Ignored received repair requests from ME: {}",
                 my_id, stats.self_repair,
